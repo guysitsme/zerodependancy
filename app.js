@@ -288,15 +288,54 @@ function handleServerMessage(data) {
   }
 }
 
+const autoStreamBtn       = document.getElementById('autoStreamBtn');
+
 // ─── Write ───────────────────────────────────────────────────────────────────
 nowBtn.addEventListener('click', () => {
   writeTimestampInput.value = nowEpoch();
 });
 
+let autoStreamTimer = null;
+
+if (autoStreamBtn) {
+  autoStreamBtn.addEventListener('click', () => {
+    if (autoStreamTimer) {
+      clearInterval(autoStreamTimer);
+      autoStreamTimer = null;
+      autoStreamBtn.textContent = 'Auto-Write (1s)';
+      autoStreamBtn.classList.remove('btn-primary');
+      autoStreamBtn.classList.add('btn-secondary');
+    } else {
+      autoStreamBtn.textContent = 'Stop Auto-Write';
+      autoStreamBtn.classList.remove('btn-secondary');
+      autoStreamBtn.classList.add('btn-primary');
+      // Fire immediately then every 1s
+      performWrite();
+      autoStreamTimer = setInterval(performWrite, 1000);
+    }
+  });
+}
+
 writeBtn.addEventListener('click', () => {
-  const series = writeSeriesInput.value.trim();
-  const value  = writeValueInput.value.trim();
-  const ts     = writeTimestampInput.value.trim();
+  performWrite();
+});
+
+function performWrite() {
+  const series = writeSeriesInput.value.trim() || state.activeSeries || 'engine_temp';
+  let valueStr = writeValueInput.value.trim();
+  let tsStr    = writeTimestampInput.value.trim();
+
+  // If timestamp is blank, automatically use current timestamp
+  if (!tsStr || isNaN(parseInt(tsStr))) {
+    tsStr = String(nowEpoch());
+    writeTimestampInput.value = tsStr;
+  }
+
+  // If value is blank, use a sensible default
+  if (valueStr === '' || isNaN(parseFloat(valueStr))) {
+    valueStr = '85.40';
+    writeValueInput.value = valueStr;
+  }
 
   // Validation
   if (!series || !/^[a-zA-Z0-9_]+$/.test(series)) {
@@ -304,16 +343,9 @@ writeBtn.addEventListener('click', () => {
     setWriteStatus('error', 'ERR invalid series');
     return;
   }
-  if (value === '' || isNaN(parseFloat(value))) {
-    showError('Invalid value — must be a number.');
-    setWriteStatus('error', 'ERR invalid value: not a number');
-    return;
-  }
-  if (!ts || isNaN(parseInt(ts))) {
-    showError('Invalid timestamp — must be a Unix epoch integer.');
-    setWriteStatus('error', 'ERR invalid timestamp');
-    return;
-  }
+  const value = parseFloat(valueStr);
+  const ts = parseInt(tsStr);
+
   if (!state.connected) {
     showError('Not connected to server. Click "Connect" first.');
     return;
@@ -323,25 +355,26 @@ writeBtn.addEventListener('click', () => {
 
   if (state.isLive && state.mainWS && state.mainWS.readyState === WebSocket.OPEN) {
     // Send live WRITE command to backend
-    state.mainWS.send(`WRITE ${series} ${ts} ${value}\n`);
-    writeValueInput.value = '';
-    writeTimestampInput.value = '';
+    state.mainWS.send(`WRITE ${series} ${ts} ${value.toFixed(2)}\n`);
   } else {
     // Demo mode: update local store
-    const point = { ts: parseInt(ts), value: parseFloat(value) };
+    const point = { ts, value };
     if (!demoStore[series]) demoStore[series] = [];
     demoStore[series].push(point);
     demoStore[series].sort((a, b) => a.ts - b.ts);
 
     setWriteStatus('ok', 'OK');
-    writeValueInput.value = '';
-    writeTimestampInput.value = '';
 
     if (state.tailing && series === state.activeSeries) {
       pushTailLine(point.ts, point.value);
     }
   }
-});
+
+  // Prepare next point with fresh timestamp and subtle jitter
+  const nextVal = +(value + (Math.random() - 0.5) * 0.6).toFixed(2);
+  writeValueInput.value = nextVal;
+  writeTimestampInput.value = nowEpoch();
+}
 
 function setWriteStatus(type, text) {
   writeResponse.textContent = text;
@@ -707,6 +740,12 @@ function startTail() {
   tailStartBtn.disabled = true;
   tailStopBtn.disabled = false;
 
+  const infoLine = document.createElement('div');
+  infoLine.className = 'terminal-line';
+  infoLine.style.opacity = '0.6';
+  infoLine.textContent = `// Subscribed to [${series}]. Listening for live points...`;
+  tailOutput.appendChild(infoLine);
+
   if (state.isLive) {
     // Open dedicated live TAIL connection
     const wsUrl = getWebSocketUrl(state.serverHost);
@@ -826,6 +865,7 @@ errorClose.addEventListener('click', hideError);
 // ─── Init ────────────────────────────────────────────────────────────────────
 function init() {
   const now = nowEpoch();
+  writeValueInput.value = '85.40';
   writeTimestampInput.value = now;
   queryEndInput.value = now;
   queryStartInput.value = now - 3600;
