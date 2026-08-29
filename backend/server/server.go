@@ -283,6 +283,6 @@ func (ws *WSServer) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Wrap the hijacked connection so handleConn can work on it transparently.
-	wsc := &wsConn{conn: conn, bufrw: bufrw}
+	wsc := newWSConn(conn, bufrw)
 	ws.tcp.handleConn(wsc)
 }

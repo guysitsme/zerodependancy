@@ -1,102 +1,94 @@
-/* ═══════════════════════════════════════════
-   CHRONOS OPERATOR DASHBOARD — app.js
-   Fully interactive, demo-mode simulation.
-   Replace TCP calls with real WebSocket/fetch
-   when the backend is ready.
-════════════════════════════════════════════ */
-
-'use strict';
+// ─── Chronos Operator Dashboard ──────────────────────────────────────────────
+// Zero-dependency frontend: supports both Live Backend (via WebSocket)
+// and fallback in-browser Demo Simulation mode.
 
 // ─── State ───────────────────────────────────────────────────────────────────
 const state = {
   connected: false,
-  serverHost: 'localhost:9000',
+  isLive: false,      // true when connected to real backend via WebSocket
+  serverHost: 'localhost:9001',
   activeSeries: 'engine_temp',
   tailing: false,
   tailCount: 0,
   tailInterval: null,
+  tailWS: null,       // dedicated WebSocket for tailing
+  mainWS: null,       // main command WebSocket
   queryResults: [],
-  queryMode: null, // 'raw' | 'hourly' | 'daily'
+  queryMode: 'raw',
+  pendingQueryCallback: null,
+  queryBuffer: [],
 };
 
-// Demo data store (simulates the backend)
+// In-memory demo store (used when offline/demo mode)
 const demoStore = {
   engine_temp: [],
-  cpu_usage: [],
-  mem_alloc: [],
+  cpu_usage:   [],
+  mem_alloc:   [],
 };
 
-// ─── DOM refs ────────────────────────────────────────────────────────────────
-const $ = (id) => document.getElementById(id);
+// ─── DOM Elements ────────────────────────────────────────────────────────────
+const globalSeriesSelect  = document.getElementById('globalSeriesSelect');
+const serverHostInput     = document.getElementById('serverHost');
+const connectBtn          = document.getElementById('connectBtn');
+const statusDot           = document.getElementById('statusDot');
+const statusLabel         = document.getElementById('statusLabel');
+const sidebar             = document.getElementById('sidebar');
+const hamburger           = document.getElementById('hamburger');
+const navLinks            = document.querySelectorAll('.nav-link');
 
-// Sidebar / connection
-const connectBtn       = $('connectBtn');
-const serverHostInput  = $('serverHost');
-const statusDot        = $('statusDot');
-const statusLabel      = $('statusLabel');
-const globalSeriesSelect = $('globalSeriesSelect');
+// Write panel
+const writeSeriesInput    = document.getElementById('writeSeries');
+const writeValueInput     = document.getElementById('writeValue');
+const writeTimestampInput = document.getElementById('writeTimestamp');
+const nowBtn              = document.getElementById('nowBtn');
+const writeBtn            = document.getElementById('writeBtn');
+const writeStatusBadge    = document.getElementById('writeStatusBadge');
+const writeResponse       = document.getElementById('writeResponse');
 
-// Write
-const writeSeriesInput    = $('writeSeries');
-const writeValueInput     = $('writeValue');
-const writeTimestampInput = $('writeTimestamp');
-const nowBtn              = $('nowBtn');
-const writeBtn            = $('writeBtn');
-const writeResponse       = $('writeResponse');
-const writeStatusBadge    = $('writeStatusBadge');
+// Query panel
+const querySeriesInput    = document.getElementById('querySeries');
+const queryStartInput     = document.getElementById('queryStart');
+const queryEndInput       = document.getElementById('queryEnd');
+const queryBtn            = document.getElementById('queryBtn');
+const queryTierBadge      = document.getElementById('queryTierBadge');
+const queryTableWrap      = document.getElementById('queryTableWrap');
+const queryTableHead      = document.getElementById('queryTableHead');
+const queryTableBody      = document.getElementById('queryTableBody');
+const queryEmpty          = document.getElementById('queryEmpty');
+const chartContainer      = document.getElementById('chartContainer');
+const queryChart          = document.getElementById('queryChart');
+const chartEmpty          = document.getElementById('chartEmpty');
 
-// Query
-const querySeriesInput = $('querySeries');
-const queryStartInput  = $('queryStart');
-const queryEndInput    = $('queryEnd');
-const queryBtn         = $('queryBtn');
-const queryTierBadge   = $('queryTierBadge');
-const queryTableWrap   = $('queryTableWrap');
-const queryTableHead   = $('queryTableHead');
-const queryTableBody   = $('queryTableBody');
-const queryEmpty       = $('queryEmpty');
-const chartEmpty       = $('chartEmpty');
-const queryChart       = $('queryChart');
-const chartContainer   = $('chartContainer');
+// Tail panel
+const tailStartBtn        = document.getElementById('tailStartBtn');
+const tailStopBtn         = document.getElementById('tailStopBtn');
+const tailClearBtn        = document.getElementById('tailClearBtn');
+const tailSeriesLabel     = document.getElementById('tailSeriesLabel');
+const tailCountEl         = document.getElementById('tailCount');
+const tailOutput          = document.getElementById('tailOutput');
 
-// Tail
-const tailStartBtn    = $('tailStartBtn');
-const tailStopBtn     = $('tailStopBtn');
-const tailClearBtn    = $('tailClearBtn');
-const tailOutput      = $('tailOutput');
-const tailSeriesLabel = $('tailSeriesLabel');
-const tailCountEl     = $('tailCount');
-
-// Benchmark
-const runBenchmarkBtn = $('runBenchmarkBtn');
-const rawSizeEl       = $('rawSize');
-const compSizeEl      = $('compSize');
-const compRatioEl     = $('compRatio');
-const efficiencyBar   = $('efficiencyBar');
-const efficiencyLabel = $('efficiencyLabel');
+// Benchmark panel
+const runBenchmarkBtn     = document.getElementById('runBenchmarkBtn');
+const rawSizeEl           = document.getElementById('rawSize');
+const compSizeEl          = document.getElementById('compSize');
+const compRatioEl         = document.getElementById('compRatio');
+const efficiencyBar       = document.getElementById('efficiencyBar');
+const efficiencyLabel     = document.getElementById('efficiencyLabel');
 
 // Error log
-const errorLog     = $('errorLog');
-const errorMessage = $('errorMessage');
-const errorClose   = $('errorClose');
+const errorLog            = document.getElementById('errorLog');
+const errorMessage        = document.getElementById('errorMessage');
+const errorClose          = document.getElementById('errorClose');
 
-// Nav
-const navLinks = document.querySelectorAll('.nav-link');
-
-// Mobile
-const hamburger = $('hamburger');
-const sidebar   = $('sidebar');
-
-// ─── Utilities ───────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function nowEpoch() {
   return Math.floor(Date.now() / 1000);
 }
 
 function formatBytes(bytes) {
-  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
-  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
-  if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
-  return bytes + ' B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
 }
 
 function showError(msg) {
@@ -108,13 +100,31 @@ function hideError() {
   errorLog.style.display = 'none';
 }
 
-function setConnectionState(connected) {
+function setConnectionState(connected, isLive = false) {
   state.connected = connected;
+  state.isLive = isLive;
   statusDot.className = 'status-dot' + (connected ? ' connected' : '');
-  statusLabel.textContent = connected
-    ? `Connected: ${state.serverHost}`
-    : 'Disconnected';
-  connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
+  
+  if (connected) {
+    statusLabel.textContent = isLive 
+      ? `Live: ${state.serverHost}` 
+      : `Demo Mode (Simulated)`;
+    connectBtn.textContent = 'Disconnect';
+  } else {
+    statusLabel.textContent = 'Disconnected';
+    connectBtn.textContent = 'Connect';
+  }
+}
+
+function getWebSocketUrl(hostInput) {
+  let host = hostInput.trim();
+  if (!host) host = 'localhost:9001';
+  // Strip http:// or https:// or ws://
+  host = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '');
+  if (!host.includes('/')) {
+    host = `${host}/ws`;
+  }
+  return `ws://${host}`;
 }
 
 // ─── Active series sync ───────────────────────────────────────────────────────
@@ -148,20 +158,135 @@ navLinks.forEach(link => {
 
 // ─── Connect / Disconnect ────────────────────────────────────────────────────
 connectBtn.addEventListener('click', () => {
-  state.serverHost = serverHostInput.value.trim() || 'localhost:9000';
   if (state.connected) {
-    setConnectionState(false);
-    if (state.tailing) stopTail();
+    disconnectServer();
   } else {
-    // Demo: simulate connection handshake
-    connectBtn.textContent = 'Connecting…';
-    connectBtn.disabled = true;
-    setTimeout(() => {
-      connectBtn.disabled = false;
-      setConnectionState(true);
-    }, 600);
+    connectServer();
   }
 });
+
+function disconnectServer() {
+  if (state.mainWS) {
+    try { state.mainWS.close(); } catch (_) {}
+    state.mainWS = null;
+  }
+  if (state.tailWS) {
+    try { state.tailWS.close(); } catch (_) {}
+    state.tailWS = null;
+  }
+  if (state.tailing) stopTail();
+  setConnectionState(false, false);
+}
+
+function connectServer() {
+  state.serverHost = serverHostInput.value.trim() || 'localhost:9001';
+  const wsUrl = getWebSocketUrl(state.serverHost);
+
+  connectBtn.textContent = 'Connecting…';
+  connectBtn.disabled = true;
+
+  try {
+    const ws = new WebSocket(wsUrl);
+
+    const timeout = setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        try { ws.close(); } catch (_) {}
+        fallbackToDemo('Server connection timed out. Switched to Demo Mode.');
+      }
+    }, 2500);
+
+    ws.onopen = () => {
+      clearTimeout(timeout);
+      connectBtn.disabled = false;
+      state.mainWS = ws;
+      setConnectionState(true, true);
+      hideError();
+    };
+
+    ws.onmessage = (e) => {
+      handleServerMessage(e.data);
+    };
+
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      if (!state.connected) {
+        fallbackToDemo(`Could not connect to ${wsUrl}. Running in Demo Mode.`);
+      } else {
+        showError('WebSocket connection error.');
+      }
+    };
+
+    ws.onclose = () => {
+      if (state.isLive) {
+        disconnectServer();
+        showError('Disconnected from backend server.');
+      }
+    };
+  } catch (err) {
+    fallbackToDemo(`Connection failed: ${err.message}. Running in Demo Mode.`);
+  }
+}
+
+function fallbackToDemo(notice) {
+  connectBtn.disabled = false;
+  state.mainWS = null;
+  setConnectionState(true, false);
+  if (notice) {
+    showError(notice);
+    setTimeout(hideError, 4000);
+  }
+}
+
+// ─── Central Server Message Handler ──────────────────────────────────────────
+function handleServerMessage(data) {
+  const lines = data.split('\n');
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Benchmark response: rawBytes,compBytes,ratio
+    if (state.pendingBenchmark) {
+      state.pendingBenchmark = false;
+      const parts = line.split(',');
+      if (parts.length === 3) {
+        const rawBytes = parseInt(parts[0]);
+        const compBytes = parseInt(parts[1]);
+        const ratio = parseFloat(parts[2]);
+        renderBenchmarkStats(rawBytes, compBytes, ratio);
+        continue;
+      }
+    }
+
+    // Query response buffering
+    if (state.pendingQuery) {
+      if (line === 'END') {
+        state.pendingQuery = false;
+        const buffered = state.queryBuffer;
+        state.queryBuffer = [];
+        processQueryLines(buffered);
+      } else if (line.startsWith('ERR')) {
+        state.pendingQuery = false;
+        state.queryBuffer = [];
+        showError(line);
+      } else {
+        state.queryBuffer.push(line);
+      }
+      continue;
+    }
+
+    // Write responses
+    if (line === 'OK') {
+      setWriteStatus('ok', 'OK');
+      continue;
+    }
+    if (line.startsWith('ERR')) {
+      setWriteStatus('error', line);
+      showError(line);
+      continue;
+    }
+  }
+}
 
 // ─── Write ───────────────────────────────────────────────────────────────────
 nowBtn.addEventListener('click', () => {
@@ -196,19 +321,25 @@ writeBtn.addEventListener('click', () => {
 
   hideError();
 
-  // Simulate TCP WRITE command + response
-  const point = { ts: parseInt(ts), value: parseFloat(value) };
-  if (!demoStore[series]) demoStore[series] = [];
-  demoStore[series].push(point);
-  demoStore[series].sort((a, b) => a.ts - b.ts);
+  if (state.isLive && state.mainWS && state.mainWS.readyState === WebSocket.OPEN) {
+    // Send live WRITE command to backend
+    state.mainWS.send(`WRITE ${series} ${ts} ${value}\n`);
+    writeValueInput.value = '';
+    writeTimestampInput.value = '';
+  } else {
+    // Demo mode: update local store
+    const point = { ts: parseInt(ts), value: parseFloat(value) };
+    if (!demoStore[series]) demoStore[series] = [];
+    demoStore[series].push(point);
+    demoStore[series].sort((a, b) => a.ts - b.ts);
 
-  setWriteStatus('ok', 'OK');
-  writeValueInput.value = '';
-  writeTimestampInput.value = '';
+    setWriteStatus('ok', 'OK');
+    writeValueInput.value = '';
+    writeTimestampInput.value = '';
 
-  // If tailing this series, push to terminal
-  if (state.tailing && series === state.activeSeries) {
-    pushTailLine(point.ts, point.value);
+    if (state.tailing && series === state.activeSeries) {
+      pushTailLine(point.ts, point.value);
+    }
   }
 });
 
@@ -253,11 +384,71 @@ queryBtn.addEventListener('click', () => {
 });
 
 function runQuery(series, start, end) {
+  if (state.isLive && state.mainWS && state.mainWS.readyState === WebSocket.OPEN) {
+    // Send live QUERY command over WebSocket
+    state.pendingQuery = true;
+    state.queryBuffer = [];
+    state.lastQueryRange = { series, start, end };
+    state.mainWS.send(`QUERY ${series} ${start} ${end}\n`);
+  } else {
+    // Demo query logic
+    runDemoQuery(series, start, end);
+  }
+}
+
+function processQueryLines(lines) {
+  if (!lines || lines.length === 0) {
+    renderQueryTierBadge('raw');
+    renderQueryTable([], 'raw');
+    drawChart([], 'raw');
+    return;
+  }
+
+  // Detect format: raw (2 cols: ts,val) or rollup (5 cols: ws,avg,min,max,count)
+  const firstCols = lines[0].split(',');
+  const isRollup = (firstCols.length === 5);
+
+  let tier = 'raw';
+  let results = [];
+
+  if (isRollup) {
+    // Determine tier from range width
+    const range = (state.lastQueryRange ? (state.lastQueryRange.end - state.lastQueryRange.start) : 0);
+    tier = (range >= 86400 * 2) ? 'daily' : 'hourly';
+
+    results = lines.map(l => {
+      const p = l.split(',');
+      return {
+        window_start: parseInt(p[0]),
+        avg: parseFloat(p[1]),
+        min: parseFloat(p[2]),
+        max: parseFloat(p[3]),
+        count: parseInt(p[4]),
+      };
+    });
+  } else {
+    tier = 'raw';
+    results = lines.map(l => {
+      const p = l.split(',');
+      return {
+        ts: parseInt(p[0]),
+        value: parseFloat(p[1]),
+      };
+    });
+  }
+
+  state.queryResults = results;
+  state.queryMode = tier;
+  renderQueryTierBadge(tier);
+  renderQueryTable(results, tier);
+  drawChart(results, tier);
+}
+
+function runDemoQuery(series, start, end) {
   const rangeWidth = end - start;
   const HOURLY_THRESHOLD = 3600 * 3;   // 3 hours
   const DAILY_THRESHOLD  = 86400 * 2;  // 2 days
 
-  // Determine tier
   let tier, results;
   if (rangeWidth >= DAILY_THRESHOLD) {
     tier = 'daily';
@@ -322,7 +513,6 @@ function buildDailyRollup(series, start, end) {
   })).sort((a, b) => a.window_start - b.window_start);
 }
 
-// Generate synthetic demo data so queries always return something
 function generateDemoData(series, start, end) {
   const interval = 60; // 1 point per minute
   const baseValues = { engine_temp: 72, cpu_usage: 45, mem_alloc: 60 };
@@ -333,7 +523,6 @@ function generateDemoData(series, start, end) {
     pts.push({ ts, value: +(base + noise).toFixed(2) });
   }
   if (!demoStore[series]) demoStore[series] = [];
-  // Merge without duplicates
   const existing = new Set(demoStore[series].map(p => p.ts));
   pts.forEach(p => { if (!existing.has(p.ts)) demoStore[series].push(p); });
   demoStore[series].sort((a, b) => a.ts - b.ts);
@@ -358,7 +547,6 @@ function renderQueryTable(results, tier) {
     return;
   }
 
-  // Header
   const isRollup = (tier === 'hourly' || tier === 'daily');
   const headers = isRollup
     ? ['window_start', 'avg', 'min', 'max', 'count']
@@ -373,7 +561,6 @@ function renderQueryTable(results, tier) {
   });
   queryTableHead.appendChild(tr);
 
-  // Rows
   results.forEach(row => {
     const tr = document.createElement('tr');
     if (isRollup) {
@@ -412,8 +599,8 @@ function drawChart(results, tier) {
   const values = isRollup ? results.map(r => r.avg) : results.map(r => r.value);
 
   const dpr = window.devicePixelRatio || 1;
-  const W = chartContainer.clientWidth;
-  const H = chartContainer.clientHeight;
+  const W = chartContainer.clientWidth || 600;
+  const H = chartContainer.clientHeight || 200;
 
   queryChart.width  = W * dpr;
   queryChart.height = H * dpr;
@@ -425,8 +612,8 @@ function drawChart(results, tier) {
   ctx.clearRect(0, 0, W, H);
 
   const PAD = { top: 16, right: 16, bottom: 28, left: 44 };
-  const plotW = W - PAD.left - PAD.right;
-  const plotH = H - PAD.top - PAD.bottom;
+  const plotW = Math.max(10, W - PAD.left - PAD.right);
+  const plotH = Math.max(10, H - PAD.top - PAD.bottom);
 
   const minVal = Math.min(...values);
   const maxVal = Math.max(...values);
@@ -443,7 +630,6 @@ function drawChart(results, tier) {
     ctx.lineTo(PAD.left + plotW, y);
     ctx.stroke();
 
-    // Y label
     const label = (maxVal - (i / gridLines) * valRange).toFixed(1);
     ctx.fillStyle = '#747878';
     ctx.font = '10px JetBrains Mono, monospace';
@@ -453,7 +639,7 @@ function drawChart(results, tier) {
 
   // Map points to canvas coords
   const pts = values.map((v, i) => ({
-    x: PAD.left + (i / (values.length - 1 || 1)) * plotW,
+    x: PAD.left + (i / Math.max(1, values.length - 1)) * plotW,
     y: PAD.top + plotH - ((v - minVal) / valRange) * plotH,
   }));
 
@@ -470,7 +656,6 @@ function drawChart(results, tier) {
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
   for (let i = 1; i < pts.length; i++) {
-    // Smooth curve
     const cpx = (pts[i - 1].x + pts[i].x) / 2;
     ctx.bezierCurveTo(cpx, pts[i - 1].y, cpx, pts[i].y, pts[i].x, pts[i].y);
   }
@@ -487,7 +672,7 @@ function drawChart(results, tier) {
     ctx.fill();
   });
 
-  // X axis labels (first, middle, last)
+  // X axis labels
   const tsArr = isRollup ? results.map(r => r.window_start) : results.map(r => r.ts);
   const xIndices = [0, Math.floor((tsArr.length - 1) / 2), tsArr.length - 1];
   xIndices.forEach(i => {
@@ -522,22 +707,59 @@ function startTail() {
   tailStartBtn.disabled = true;
   tailStopBtn.disabled = false;
 
-  // Simulate live stream — push a new point every 1s
-  const base = { engine_temp: 72, cpu_usage: 45, mem_alloc: 60 }[series] || 50;
-  state.tailInterval = setInterval(() => {
-    const ts = nowEpoch();
-    const value = +(base + (Math.random() - 0.5) * 8).toFixed(2);
-    pushTailLine(ts, value);
-    // Also store it
-    if (!demoStore[series]) demoStore[series] = [];
-    demoStore[series].push({ ts, value });
-  }, 1000);
+  if (state.isLive) {
+    // Open dedicated live TAIL connection
+    const wsUrl = getWebSocketUrl(state.serverHost);
+    try {
+      const ws = new WebSocket(wsUrl);
+      state.tailWS = ws;
+
+      ws.onopen = () => {
+        ws.send(`TAIL ${series}\n`);
+      };
+
+      ws.onmessage = (e) => {
+        const lines = e.data.split('\n');
+        for (const l of lines) {
+          const trimmed = l.trim();
+          if (!trimmed || trimmed.startsWith('ERR')) continue;
+          const [ts, val] = trimmed.split(',');
+          if (ts && val) {
+            pushTailLine(parseInt(ts), parseFloat(val));
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        if (state.tailing) stopTail();
+      };
+    } catch (err) {
+      showError(`Tail connection failed: ${err.message}`);
+      stopTail();
+    }
+  } else {
+    // Demo stream simulation
+    const base = { engine_temp: 72, cpu_usage: 45, mem_alloc: 60 }[series] || 50;
+    state.tailInterval = setInterval(() => {
+      const ts = nowEpoch();
+      const value = +(base + (Math.random() - 0.5) * 8).toFixed(2);
+      pushTailLine(ts, value);
+      if (!demoStore[series]) demoStore[series] = [];
+      demoStore[series].push({ ts, value });
+    }, 1000);
+  }
 }
 
 function stopTail() {
   state.tailing = false;
-  clearInterval(state.tailInterval);
-  state.tailInterval = null;
+  if (state.tailWS) {
+    try { state.tailWS.close(); } catch (_) {}
+    state.tailWS = null;
+  }
+  if (state.tailInterval) {
+    clearInterval(state.tailInterval);
+    state.tailInterval = null;
+  }
   tailStartBtn.disabled = false;
   tailStopBtn.disabled = true;
 
@@ -557,10 +779,7 @@ function pushTailLine(ts, value) {
   line.innerHTML = `&gt; <span class="ts">${ts}</span>, <span class="val">${value}</span>`;
   tailOutput.appendChild(line);
 
-  // Auto-scroll
   tailOutput.scrollTop = tailOutput.scrollHeight;
-
-  // Keep max 200 lines
   while (tailOutput.children.length > 200) {
     tailOutput.removeChild(tailOutput.firstChild);
   }
@@ -573,24 +792,32 @@ function runBenchmark() {
   runBenchmarkBtn.textContent = 'Running…';
   runBenchmarkBtn.disabled = true;
 
-  setTimeout(() => {
-    // Simulate Gorilla compression on 24h of 1s data
-    const pointCount = 86400;          // 24h × 1 point/sec
-    const rawBytes   = pointCount * 16; // 8B ts + 8B float
-    // Realistic Gorilla ratio: ~14x for smooth sensor data
-    const ratio        = 13.8 + Math.random() * 1.2;
-    const compBytes    = Math.round(rawBytes / ratio);
-    const efficiency   = Math.round((1 - 1 / ratio) * 100);
+  if (state.isLive && state.mainWS && state.mainWS.readyState === WebSocket.OPEN) {
+    state.pendingBenchmark = true;
+    state.mainWS.send('BENCHMARK\n');
+  } else {
+    // Demo simulation
+    setTimeout(() => {
+      const pointCount = 86400;
+      const rawBytes   = pointCount * 16;
+      const ratio      = 13.8 + Math.random() * 1.2;
+      const compBytes  = Math.round(rawBytes / ratio);
+      renderBenchmarkStats(rawBytes, compBytes, ratio);
+    }, 800);
+  }
+}
 
-    rawSizeEl.textContent   = formatBytes(rawBytes);
-    compSizeEl.textContent  = formatBytes(compBytes);
-    compRatioEl.textContent = ratio.toFixed(1) + 'x';
-    efficiencyBar.style.width = efficiency + '%';
-    efficiencyLabel.textContent = efficiency + '%';
+function renderBenchmarkStats(rawBytes, compBytes, ratio) {
+  const efficiency = Math.min(100, Math.max(0, Math.round((1 - (compBytes / (rawBytes || 1))) * 100)));
 
-    runBenchmarkBtn.textContent = 'Run';
-    runBenchmarkBtn.disabled = false;
-  }, 900);
+  rawSizeEl.textContent   = formatBytes(rawBytes);
+  compSizeEl.textContent  = formatBytes(compBytes);
+  compRatioEl.textContent = (ratio ? ratio.toFixed(2) : (rawBytes / (compBytes || 1)).toFixed(2)) + 'x';
+  efficiencyBar.style.width = efficiency + '%';
+  efficiencyLabel.textContent = efficiency + '%';
+
+  runBenchmarkBtn.textContent = 'Run';
+  runBenchmarkBtn.disabled = false;
 }
 
 // ─── Error close ─────────────────────────────────────────────────────────────
@@ -598,18 +825,16 @@ errorClose.addEventListener('click', hideError);
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 function init() {
-  // Seed timestamp inputs
   const now = nowEpoch();
   writeTimestampInput.value = now;
   queryEndInput.value = now;
-  queryStartInput.value = now - 3600; // default: last 1 hour
+  queryStartInput.value = now - 3600;
 
-  // Sync global series
   writeSeriesInput.value = state.activeSeries;
   querySeriesInput.value = state.activeSeries;
 
-  // Auto-connect in demo mode
-  setTimeout(() => setConnectionState(true), 400);
+  // Auto-connect to local backend or fallback to demo
+  connectServer();
 }
 
 init();
