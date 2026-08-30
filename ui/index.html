@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="description" content="Chronos Operator Dashboard — Zero-dependency time-series database interface for writing, querying, and tailing real-time data."/>
+  <title>Chronos — Operator Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════
+     SIDEBAR
+════════════════════════════════════════════ -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <h1 class="logo">Chronos</h1>
+    <div class="connection-status" id="connectionStatus">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-label" id="statusLabel">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <label class="sidebar-label">SERIES</label>
+    <div class="select-wrapper">
+      <select id="globalSeriesSelect" class="input-base mono">
+        <option value="engine_temp">engine_temp</option>
+        <option value="cpu_usage">cpu_usage</option>
+        <option value="mem_alloc">mem_alloc</option>
+      </select>
+      <svg class="select-arrow" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <label class="sidebar-label">SERVER</label>
+    <input id="serverHost" class="input-base mono" type="text" value="localhost:9001" placeholder="host:port"/>
+  </div>
+
+  <nav class="sidebar-nav">
+    <a href="#write" class="nav-link active" data-section="write">
+      <span class="nav-icon">&#x270F;</span> Write
+    </a>
+    <a href="#query" class="nav-link" data-section="query">
+      <span class="nav-icon">&#x2315;</span> Query
+    </a>
+    <a href="#tail" class="nav-link" data-section="tail">
+      <span class="nav-icon">&#x25CE;</span> Tail
+    </a>
+    <a href="#benchmark" class="nav-link" data-section="benchmark">
+      <span class="nav-icon">&#x25C8;</span> Benchmark
+    </a>
+  </nav>
+
+  <div class="sidebar-footer">
+    <button class="btn-secondary w-full" id="connectBtn">Connect</button>
+  </div>
+</aside>
+
+<!-- Mobile top bar -->
+<header class="mobile-header">
+  <h1 class="logo-sm">Chronos</h1>
+  <button class="hamburger" id="hamburger" aria-label="Open menu">
+    <span></span><span></span><span></span>
+  </button>
+</header>
+
+<!-- ═══════════════════════════════════════════
+     MAIN CONTENT
+════════════════════════════════════════════ -->
+<main class="main-content">
+
+  <!-- ─── WRITE PANEL ─── -->
+  <section class="card" id="write">
+    <div class="card-header">
+      <h2 class="section-title">Write Data</h2>
+      <span class="badge" id="writeStatusBadge">READY</span>
+    </div>
+
+    <div class="form-grid">
+      <div class="form-group">
+        <label class="form-label">Series</label>
+        <input id="writeSeries" class="input-base mono" type="text" value="engine_temp" placeholder="series_name"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Value</label>
+        <input id="writeValue" class="input-base mono" type="number" step="any" value="85.4" placeholder="85.40"/>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Timestamp (Unix Epoch)</label>
+      <div class="input-row">
+        <input id="writeTimestamp" class="input-base mono flex-1" type="text" placeholder="1735000000"/>
+        <button class="btn-secondary" id="nowBtn">Now</button>
+      </div>
+    </div>
+
+    <div class="card-footer">
+      <div class="response-tag" id="writeResponse">&#x2013;</div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn-secondary" id="autoStreamBtn">Auto-Write (1s)</button>
+        <button class="btn-primary" id="writeBtn">Write</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── BENCHMARK PANEL ─── -->
+  <section class="card" id="benchmark">
+    <div class="card-header">
+      <h2 class="section-title">Compression Benchmark</h2>
+      <button class="btn-ghost" id="runBenchmarkBtn">Run</button>
+    </div>
+    <div class="benchmark-grid">
+      <div class="stat-card">
+        <span class="stat-label">Raw Size</span>
+        <span class="stat-value mono" id="rawSize">&#x2013;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Compressed</span>
+        <span class="stat-value mono" id="compSize">&#x2013;</span>
+      </div>
+      <div class="stat-card highlight">
+        <span class="stat-label">Ratio</span>
+        <span class="stat-value mono bold" id="compRatio">&#x2013;</span>
+      </div>
+    </div>
+    <div class="benchmark-bar-container">
+      <div class="benchmark-bar-label">
+        <span class="mono text-sm">Compression efficiency</span>
+        <span class="mono text-sm" id="efficiencyLabel">&#x2013;</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill" id="efficiencyBar" style="width: 0%"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── QUERY PANEL ─── -->
+  <section class="card full-width" id="query">
+    <div class="card-header">
+      <div class="header-left">
+        <h2 class="section-title">Query</h2>
+        <span class="badge" id="queryTierBadge" style="display:none">&#x2013;</span>
+      </div>
+      <button class="btn-primary" id="queryBtn">Query</button>
+    </div>
+
+    <div class="query-form">
+      <div class="form-group">
+        <label class="form-label">Series</label>
+        <input id="querySeries" class="input-base mono" type="text" value="engine_temp"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Start (Epoch)</label>
+        <input id="queryStart" class="input-base mono" type="text" placeholder="1735000000"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">End (Epoch)</label>
+        <input id="queryEnd" class="input-base mono" type="text" placeholder="1735086400"/>
+      </div>
+    </div>
+
+    <!-- Chart -->
+    <div class="chart-container" id="chartContainer">
+      <div class="chart-empty" id="chartEmpty">Run a query to visualise data</div>
+      <canvas id="queryChart" style="display:none"></canvas>
+    </div>
+
+    <!-- Results table -->
+    <div class="table-scroll" id="queryTableWrap" style="display:none">
+      <table class="data-table" id="queryTable">
+        <thead id="queryTableHead"></thead>
+        <tbody id="queryTableBody"></tbody>
+      </table>
+    </div>
+    <div class="empty-state" id="queryEmpty" style="display:none">No data returned.</div>
+  </section>
+
+  <!-- ─── TAIL PANEL ─── -->
+  <section class="card terminal-card full-width" id="tail">
+    <div class="terminal-header">
+      <div class="terminal-meta">
+        <span class="terminal-series mono" id="tailSeriesLabel">&#x2013;</span>
+        <span class="terminal-count mono" id="tailCount">0 points received</span>
+      </div>
+      <div class="terminal-actions">
+        <button class="btn-terminal" id="tailStartBtn">Start Tail</button>
+        <button class="btn-terminal-stop" id="tailStopBtn" disabled>Stop Tail</button>
+        <button class="btn-ghost-light" id="tailClearBtn">Clear</button>
+      </div>
+    </div>
+    <div class="terminal-body" id="tailOutput">
+      <div class="terminal-placeholder">// Connect and start tailing a series to see live data stream here</div>
+    </div>
+  </section>
+
+  <!-- ─── ERROR / LOG AREA ─── -->
+  <div class="error-log" id="errorLog" style="display:none">
+    <span class="error-prefix">ERR</span>
+    <span id="errorMessage"></span>
+    <button class="error-close" id="errorClose">&#x2715;</button>
+  </div>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
