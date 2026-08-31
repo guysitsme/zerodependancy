@@ -11,7 +11,7 @@ import (
 func mustRoundTrip(t *testing.T, pts []Point) {
 	t.Helper()
 	enc := Encode(pts)
-	got, err := Decode(enc)
+	got, err := Decode(enc, len(pts))
 	if err != nil {
 		t.Fatalf("Decode error: %v", err)
 	}
@@ -31,7 +31,7 @@ func mustRoundTrip(t *testing.T, pts []Point) {
 // ─── Test 1: empty round-trip ─────────────────────────────────────────────────
 
 func TestEncodeDecodeEmpty(t *testing.T) {
-	got, err := Decode(Encode(nil))
+	got, err := Decode(Encode(nil), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +64,17 @@ func TestEncodeDecodeLargeGap(t *testing.T) {
 		{TS: 1000, Value: 1.0},
 		{TS: 1060, Value: 1.1},
 		{TS: 1_000_000, Value: 1.2}, // dod = ~998879, needs 32-bit
+	}
+	mustRoundTrip(t, pts)
+}
+
+// ─── Test 4b: 64-bit time delta (exceeds 32-bit int range) ────────────────────
+
+func TestEncodeDecodeLarge64BitDelta(t *testing.T) {
+	pts := []Point{
+		{TS: 1000, Value: 1.0},
+		{TS: 1000 + 5_000_000_000, Value: 1.1}, // delta1 = 5 billion (> 2^31)
+		{TS: 1000 + 10_000_000_000, Value: 1.2},
 	}
 	mustRoundTrip(t, pts)
 }
@@ -112,7 +123,7 @@ func TestEncodeDecodeFuzz(t *testing.T) {
 			pts[i] = Point{TS: ts, Value: rng.Float64()*2000 - 1000}
 		}
 		enc := Encode(pts)
-		got, err := Decode(enc)
+		got, err := Decode(enc, len(pts))
 		if err != nil {
 			t.Fatalf("iter %d: Decode error: %v", iter, err)
 		}
@@ -130,13 +141,28 @@ func TestEncodeDecodeFuzz(t *testing.T) {
 // ─── Test 9: truncated input raises ErrTruncatedInput ───────────────────────
 
 func TestBitReaderTruncated(t *testing.T) {
-	// Encode a real payload, then truncate it by one byte.
+	// Encode a real payload, then truncate it.
 	pts := []Point{{TS: 1000, Value: 1.0}, {TS: 1060, Value: 2.0}, {TS: 1120, Value: 3.0}}
 	enc := Encode(pts)
-	truncated := enc[:len(enc)/2] // deliberately truncated
-	_, err := Decode(truncated)
+
+	// Truncate timestamp stream
+	truncTS := EncodedStreams{
+		Timestamps: enc.Timestamps[:len(enc.Timestamps)/2],
+		Values:     enc.Values,
+	}
+	_, err := Decode(truncTS, len(pts))
 	if err == nil {
-		t.Fatal("expected error on truncated input, got nil")
+		t.Fatal("expected error on truncated TS input, got nil")
+	}
+
+	// Truncate values stream
+	truncVal := EncodedStreams{
+		Timestamps: enc.Timestamps,
+		Values:     enc.Values[:len(enc.Values)/2],
+	}
+	_, err = Decode(truncVal, len(pts))
+	if err == nil {
+		t.Fatal("expected error on truncated Values input, got nil")
 	}
 }
 

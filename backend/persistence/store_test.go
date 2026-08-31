@@ -1,10 +1,14 @@
 package persistence
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"chronos/compression"
 )
 
 // TestWALCrashRecovery tests that points written to unrotated memory buffers
@@ -78,5 +82,117 @@ func TestWALCrashRecovery(t *testing.T) {
 
 	if info, err := os.Stat(walFile); err != nil || info.Size() != 0 {
 		t.Errorf("expected truncated WAL file size 0, got err: %v, size: %d", err, info.Size())
+	}
+}
+
+// TestConcurrentWritesAndQueries verifies concurrent writes to the same series,
+// concurrent writes to different series, and concurrent queries under the race detector.
+func TestConcurrentWritesAndQueries(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "chronos_concurrency_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	s, err := Open(tempDir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	const (
+		numWriters    = 8
+		pointsPerW    = 50
+		sameSeries    = "concurrent_series"
+		diffSeriesPfx = "series_"
+	)
+
+	var wg sync.WaitGroup
+	startSignal := make(chan struct{})
+
+	// 1. Concurrent writers to the SAME series
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-startSignal
+			for i := 0; i < pointsPerW; i++ {
+				ts := uint64(1_700_000_000 + workerID*1000 + i)
+				val := float64(workerID)*100.0 + float64(i)
+				if err := s.WritePoint(sameSeries, ts, val); err != nil {
+					t.Errorf("WritePoint failed: %v", err)
+				}
+			}
+		}(w)
+	}
+
+	// 2. Concurrent writers to DIFFERENT series
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-startSignal
+			series := fmt.Sprintf("%s%d", diffSeriesPfx, workerID)
+			for i := 0; i < pointsPerW; i++ {
+				ts := uint64(1_700_000_000 + i*10)
+				val := float64(i) * 1.5
+				if err := s.WritePoint(series, ts, val); err != nil {
+					t.Errorf("WritePoint diff series failed: %v", err)
+				}
+			}
+		}(w)
+	}
+
+	// 3. Concurrent readers executing FindChunks and GetBufferedPoints
+	stopReaders := make(chan struct{})
+	var rWg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		rWg.Add(1)
+		go func() {
+			defer rWg.Done()
+			<-startSignal
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					_ = s.FindChunks(sameSeries, 1_700_000_000, 1_800_000_000)
+					_ = s.GetBufferedPoints(sameSeries)
+					_ = s.GetAllSeriesMeta()
+				}
+			}
+		}()
+	}
+
+	// Launch all goroutines simultaneously
+	close(startSignal)
+
+	// Wait for all writers to complete
+	wg.Wait()
+
+	// Stop readers
+	close(stopReaders)
+	rWg.Wait()
+
+	// Flush the series to commit in-memory buffers to chunks
+	if err := s.FlushSeries(sameSeries); err != nil {
+		t.Fatalf("FlushSeries failed: %v", err)
+	}
+
+	// Read all chunks for the series and verify point count
+	chunks := s.FindChunks(sameSeries, 0, ^uint64(0))
+	var recoveredPoints []compression.Point
+	for _, ch := range chunks {
+		pts, err := s.ReadChunk(sameSeries, ch)
+		if err != nil {
+			t.Fatalf("ReadChunk %s failed: %v", ch, err)
+		}
+		recoveredPoints = append(recoveredPoints, pts...)
+	}
+	// Add any remaining buffered points
+	recoveredPoints = append(recoveredPoints, s.GetBufferedPoints(sameSeries)...)
+
+	expectedCount := numWriters * pointsPerW
+	if len(recoveredPoints) != expectedCount {
+		t.Fatalf("expected %d total points for %s, got %d", expectedCount, sameSeries, len(recoveredPoints))
 	}
 }

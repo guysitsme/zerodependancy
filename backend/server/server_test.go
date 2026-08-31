@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -263,5 +264,62 @@ func TestWriteAndQueryRoundtrip(t *testing.T) {
 	}
 	if dataLines != writeCount {
 		t.Errorf("expected %d data lines, got %d (lines: %v)", writeCount, dataLines, lines)
+	}
+}
+
+// ── Test 9: WebSocket oversized frame (>1MB) rejected before buffer allocation ─
+
+func TestWebSocketOversizedFrameRejected(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	bufrw := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
+	ws := newWSConn(serverConn, bufrw)
+
+	// Send an oversized frame header: opcode 0x81 (text), payloadLen 127, 8-byte length = 10 MB (exceeds 1 MB limit)
+	go func() {
+		var hdr [10]byte
+		hdr[0] = 0x81 // text frame
+		hdr[1] = 127  // 8-byte extended length, unmasked
+		binary.BigEndian.PutUint64(hdr[2:10], 10*1024*1024)
+		_, _ = clientConn.Write(hdr[:])
+	}()
+
+	buf := make([]byte, 256)
+	_, err := ws.Read(buf)
+	if err == nil {
+		t.Fatal("expected error reading oversized websocket frame, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("expected error message mentioning exceeds limit, got: %v", err)
+	}
+}
+
+// ── Test 10: WebSocket normal frame parses correctly ──────────────────────────
+
+func TestWebSocketNormalFrame(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	bufrw := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
+	ws := newWSConn(serverConn, bufrw)
+
+	msg := "WRITE ws_test 1735000000 42.0"
+	go func() {
+		// Send normal text frame (< 126 bytes)
+		hdr := []byte{0x81, byte(len(msg))}
+		_, _ = clientConn.Write(append(hdr, []byte(msg)...))
+	}()
+
+	buf := make([]byte, 256)
+	n, err := ws.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected error reading normal websocket frame: %v", err)
+	}
+	got := string(buf[:n])
+	if !strings.HasPrefix(got, msg) {
+		t.Errorf("expected payload prefix %q, got %q", msg, got)
 	}
 }

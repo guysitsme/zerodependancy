@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -19,9 +20,10 @@ import (
 
 // IngestConfig controls which free-API feeds are enabled.
 type IngestConfig struct {
-	Weather bool
-	Crypto  bool
-	Forex   bool
+	Weather  bool
+	Crypto   bool
+	Forex    bool
+	DemoMode bool
 }
 
 // PointWriter abstracts any target that can receive points.
@@ -29,9 +31,15 @@ type PointWriter interface {
 	WritePoint(series string, ts uint64, value float64) error
 }
 
-// StartIngest launches background goroutines that poll public APIs and write
-// data into the provided PointWriter (TCPServer or Engine). Call once after the server is ready.
+// StartIngest launches background goroutines that ingest time-series data into the
+// provided PointWriter (TCPServer or Engine).
+// If DemoMode is true or CHRONOS_DEMO_MODE is set, smooth synthetic values are generated
+// offline without external API network requests.
 func StartIngest(writer PointWriter, cfg IngestConfig) {
+	if cfg.DemoMode || os.Getenv("CHRONOS_DEMO_MODE") == "1" || os.Getenv("CHRONOS_DEMO_MODE") == "true" {
+		go ingestSyntheticDemo(writer)
+		return
+	}
 	if cfg.Weather {
 		go ingestWeather(writer)
 	}
@@ -40,6 +48,45 @@ func StartIngest(writer PointWriter, cfg IngestConfig) {
 	}
 	if cfg.Forex {
 		go ingestForex(writer)
+	}
+}
+
+// ── Synthetic Demo Mode (deterministic offline generator) ────────────────────
+
+func ingestSyntheticDemo(writer PointWriter) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var tick uint64
+	generateDemoPoints := func() {
+		ts := uint64(time.Now().Unix())
+		phase := float64(tick) * 0.05
+
+		// Smooth sinusoidal curves for standard series
+		temp := 28.0 + 5.0*math.Sin(phase)
+		wind := 15.0 + 6.0*math.Cos(phase*0.8)
+		humidity := 55.0 - 15.0*math.Sin(phase*0.7)
+		btc := 88000.0 + 2500.0*math.Sin(phase*0.4) + 400.0*math.Cos(phase*1.2)
+		eth := 3200.0 + 150.0*math.Sin(phase*0.5)
+		eurUSD := 1.0850 + 0.0040*math.Sin(phase*0.3)
+		eurGBP := 0.8550 + 0.0025*math.Cos(phase*0.35)
+		eurJPY := 162.50 + 1.20*math.Sin(phase*0.25)
+
+		write(writer, "weather_temp_c", ts, temp)
+		write(writer, "weather_wind_kmh", ts, wind)
+		write(writer, "weather_humidity_pct", ts, humidity)
+		write(writer, "btc_usd", ts, btc)
+		write(writer, "eth_usd", ts, eth)
+		write(writer, "forex_eur_USD", ts, eurUSD)
+		write(writer, "forex_eur_GBP", ts, eurGBP)
+		write(writer, "forex_eur_JPY", ts, eurJPY)
+
+		tick++
+	}
+
+	generateDemoPoints()
+	for range ticker.C {
+		generateDemoPoints()
 	}
 }
 

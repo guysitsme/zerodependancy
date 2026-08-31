@@ -3,6 +3,7 @@ package rollup
 import (
 	"math"
 	"os"
+	"sync"
 	"testing"
 
 	"chronos/config"
@@ -240,5 +241,104 @@ func TestQueryEmptySeries(t *testing.T) {
 func TestRollupRecordSize(t *testing.T) {
 	if rollupRecordSize != 36 {
 		t.Fatalf("rollupRecordSize should be 36, is %d", rollupRecordSize)
+	}
+}
+
+// ── Test 9: Engine Flush finalizes open hourly bucket without hour boundary crossing ─
+
+func TestEngineFlushOpenBucket(t *testing.T) {
+	eng, dir := newTestEngine(t)
+	defer os.RemoveAll(dir)
+
+	bucketStart := uint64(3600 * 500)
+	// Write 10 points within the same hour bucket (no boundary crossing)
+	for i := uint64(0); i < 10; i++ {
+		if err := eng.WritePoint("flush_series", bucketStart+i*60, 50.0+float64(i)); err != nil {
+			t.Fatalf("WritePoint failed: %v", err)
+		}
+	}
+
+	// Flush the engine (as happens during shutdown)
+	eng.Flush()
+
+	// Verify the hourly rollup record was written to disk
+	recs, err := eng.readRollupFile("flush_series", "hourly_rollup.dat", bucketStart, bucketStart+3600)
+	if err != nil {
+		t.Fatalf("readRollupFile failed: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 flushed hourly rollup record, got %d", len(recs))
+	}
+	if recs[0].Count != 10 {
+		t.Errorf("expected count 10, got %d", recs[0].Count)
+	}
+	if recs[0].WindowStart != bucketStart {
+		t.Errorf("expected WindowStart %d, got %d", bucketStart, recs[0].WindowStart)
+	}
+}
+
+// ── Test 10: Concurrent writes and queries on Engine ──────────────────────────
+
+func TestEngineConcurrentWritesAndQueries(t *testing.T) {
+	eng, dir := newTestEngine(t)
+	defer os.RemoveAll(dir)
+
+	const (
+		numWriters = 6
+		numPoints  = 50
+		seriesName = "concurrent_engine_series"
+	)
+
+	var wg sync.WaitGroup
+	startSignal := make(chan struct{})
+
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-startSignal
+			baseTS := uint64(1_700_000_000 + workerID*1000)
+			for i := 0; i < numPoints; i++ {
+				if err := eng.WritePoint(seriesName, baseTS+uint64(i), float64(workerID*10+i)); err != nil {
+					t.Errorf("WritePoint failed: %v", err)
+				}
+			}
+		}(w)
+	}
+
+	stopReaders := make(chan struct{})
+	var rWg sync.WaitGroup
+	for r := 0; r < 3; r++ {
+		rWg.Add(1)
+		go func() {
+			defer rWg.Done()
+			<-startSignal
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					_, _ = eng.Query(seriesName, 1_700_000_000, 1_800_000_000)
+					_ = eng.GetAllSeriesMeta()
+				}
+			}
+		}()
+	}
+
+	close(startSignal)
+	wg.Wait()
+	close(stopReaders)
+	rWg.Wait()
+
+	eng.Flush()
+
+	// Query raw results and verify total count
+	res, err := eng.Query(seriesName, 0, ^uint64(0))
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	expected := numWriters * numPoints
+	if len(res.Raw) != expected {
+		t.Errorf("expected %d raw points, got %d", expected, len(res.Raw))
 	}
 }

@@ -155,6 +155,31 @@ func (e *Engine) updateAccumulator(series string, ts uint64, value float64) {
 	acc.count++
 }
 
+// Flush finalizes any currently open hourly accumulator buckets across all series
+// and persists them to hourly_rollup.dat. This ensures that in-progress hour buckets
+// are not lost during server shutdown.
+func (e *Engine) Flush() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for series, acc := range e.accumulators {
+		if acc != nil && acc.count > 0 {
+			rec := RollupRecord{
+				WindowStart: acc.windowStart,
+				Avg:         acc.sum / float64(acc.count),
+				Min:         acc.min,
+				Max:         acc.max,
+				Count:       acc.count,
+			}
+			_ = e.appendHourlyRecord(series, rec)
+			e.maybeFinalizeDailyRecord(series, acc.windowStart)
+			fresh := newAccumulator()
+			fresh.windowStart = acc.windowStart
+			*acc = fresh
+		}
+	}
+}
+
 // appendHourlyRecord appends a RollupRecord to the series' hourly rollup file.
 func (e *Engine) appendHourlyRecord(series string, rec RollupRecord) error {
 	path := filepath.Join(e.dataDir, series, "hourly_rollup.dat")

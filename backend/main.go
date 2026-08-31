@@ -17,7 +17,8 @@ import (
 
 func main() {
 	dataDir := flag.String("data", "data", "directory for series data files")
-	ingest  := flag.Bool("ingest", true, "enable background ingestion from free public APIs (weather, crypto, forex)")
+	ingest := flag.Bool("ingest", true, "enable background ingestion from free public APIs (weather, crypto, forex)")
+	demo := flag.Bool("demo", os.Getenv("CHRONOS_DEMO_MODE") == "1" || os.Getenv("CHRONOS_DEMO_MODE") == "true", "enable synthetic demo ingestion mode (no external APIs required)")
 	flag.Parse()
 
 	// ── Open the persistence store (Chunk 2)
@@ -39,22 +40,28 @@ func main() {
 		}
 	}()
 
-	// ── Start free-API ingestion if enabled
+	// ── Start free-API or synthetic demo ingestion if enabled
 	if *ingest {
 		server.StartIngest(tcpSrv, server.IngestConfig{
-			Weather: true,
-			Crypto:  true,
-			Forex:   true,
+			Weather:  true,
+			Crypto:   true,
+			Forex:    true,
+			DemoMode: *demo,
 		})
-		fmt.Fprintln(os.Stdout, "Chronos ingest: polling Open-Meteo, CoinGecko, Frankfurter…")
+		if *demo {
+			fmt.Fprintln(os.Stdout, "Chronos ingest: running in SYNTHETIC DEMO mode (offline, smooth curves)")
+		} else {
+			fmt.Fprintln(os.Stdout, "Chronos ingest: polling Open-Meteo, CoinGecko, Frankfurter…")
+		}
 	}
 
-	// ── Graceful shutdown handler: flush all in-memory buffers on SIGINT/SIGTERM
+	// ── Graceful shutdown handler: flush all in-memory buffers and open rollup accumulators on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
-		fmt.Fprintf(os.Stdout, "\nChronos: received %v — flushing all series buffers…\n", sig)
+		fmt.Fprintf(os.Stdout, "\nChronos: received %v — flushing all series buffers and rollup accumulators…\n", sig)
+		engine.Flush()
 		store.FlushAllSeries()
 		fmt.Fprintln(os.Stdout, "Chronos: all data flushed. Goodbye.")
 		os.Exit(0)

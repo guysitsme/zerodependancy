@@ -33,6 +33,9 @@ func newWSConn(conn net.Conn, bufrw *bufio.ReadWriter) *wsConn {
 	}
 }
 
+// MaxIncomingPayloadSize limits WebSocket frame size to prevent unbounded memory allocation (1 MB).
+const MaxIncomingPayloadSize = 1 << 20
+
 // Read reads and unmasks one or more RFC 6455 frames into b.
 func (c *wsConn) Read(b []byte) (int, error) {
 	for len(c.readBuf) == 0 {
@@ -68,6 +71,12 @@ func (c *wsConn) Read(b []byte) (int, error) {
 				return 0, err
 			}
 			payloadLen = binary.BigEndian.Uint64(ext[:])
+		}
+
+		// Reject oversized frames BEFORE allocating the payload buffer
+		if payloadLen > MaxIncomingPayloadSize {
+			c.Close()
+			return 0, fmt.Errorf("server: websocket frame payload size %d exceeds limit of %d bytes", payloadLen, MaxIncomingPayloadSize)
 		}
 
 		var maskKey [4]byte

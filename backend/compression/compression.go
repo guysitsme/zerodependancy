@@ -4,7 +4,6 @@
 package compression
 
 import (
-	"encoding/binary"
 	"errors"
 	"math"
 	"math/bits"
@@ -13,13 +12,18 @@ import (
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 var ErrTruncatedInput = errors.New("compression: truncated input")
-var ErrInvalidHeader = errors.New("compression: invalid header")
 
-// ── Point ─────────────────────────────────────────────────────────────────────
+// ── Point & EncodedStreams ───────────────────────────────────────────────────
 
 type Point struct {
 	TS    uint64
 	Value float64
+}
+
+// EncodedStreams holds separate Gorilla-compressed bitstreams for timestamps and values.
+type EncodedStreams struct {
+	Timestamps []byte
+	Values     []byte
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -100,16 +104,18 @@ func (r *bitReader) readBits(n uint) (uint64, error) {
 // ══════════════════════════════════════════════════════════════════════════════
 // Encode
 //
-// Wire format:
-//   [4 bytes uint32 count]
-//   [64 bits: t0]
-//   [64 bits: v0 raw float64]
-//   if count >= 2:
-//     [32 bits: delta1 signed]   (t1 - t0)
-//     [value encoding for v1]
-//   for each subsequent point i >= 2:
-//     [dod encoding for ts[i]]
-//     [value encoding for vs[i]]
+// Streams format:
+//   Timestamps stream:
+//     [64 bits: t0]
+//     if count >= 2:
+//       [64 bits: delta1 signed] (t1 - t0)
+//     for each subsequent point i >= 2:
+//       [dod encoding for ts[i]]
+//
+//   Values stream:
+//     [64 bits: v0 raw float64 bits]
+//     for each subsequent point i >= 1:
+//       [value XOR encoding for vs[i]]
 //
 // Value encoding (per point):
 //   0           → unchanged (xor == 0)
@@ -124,51 +130,56 @@ func (r *bitReader) readBits(n uint) (uint64, error) {
 //   1111[32]    → full 32-bit
 // ══════════════════════════════════════════════════════════════════════════════
 
-func Encode(points []Point) []byte {
-	w := newBitWriter()
-
-	// 4-byte count header written directly as bytes (not through bit writer).
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(points)))
-	w.buf = append(w.buf, hdr[:]...)
-
+func Encode(points []Point) EncodedStreams {
 	if len(points) == 0 {
-		return w.flush()
+		return EncodedStreams{}
 	}
+
+	wTS := newBitWriter()
+	wVal := newBitWriter()
 
 	// First point: raw 64-bit ts and float.
-	w.writeBits(points[0].TS, 64)
-	w.writeBits(math.Float64bits(points[0].Value), 64)
+	wTS.writeBits(points[0].TS, 64)
+	wVal.writeBits(math.Float64bits(points[0].Value), 64)
 
 	if len(points) == 1 {
-		return w.flush()
+		return EncodedStreams{
+			Timestamps: wTS.flush(),
+			Values:     wVal.flush(),
+		}
 	}
 
-	// Second point: full signed 32-bit delta + value (no window yet).
+	// Second point: full signed 64-bit delta + value (no window yet).
 	delta1 := int64(points[1].TS) - int64(points[0].TS)
-	w.writeBits(uint64(int32(delta1)), 32)
+	wTS.writeBits(uint64(delta1), 64)
 
 	prevBits := math.Float64bits(points[0].Value)
 	var prevLZ, prevMBC uint
 	var hasWindow bool
-	prevBits, prevLZ, prevMBC, hasWindow = encodeXOR(w, math.Float64bits(points[1].Value), prevBits, prevLZ, prevMBC, hasWindow)
+	prevBits, prevLZ, prevMBC, hasWindow = encodeXOR(wVal, math.Float64bits(points[1].Value), prevBits, prevLZ, prevMBC, hasWindow)
 
 	if len(points) == 2 {
-		return w.flush()
+		return EncodedStreams{
+			Timestamps: wTS.flush(),
+			Values:     wVal.flush(),
+		}
 	}
 
 	prevDelta := delta1
 	for i := 2; i < len(points); i++ {
 		delta := int64(points[i].TS) - int64(points[i-1].TS)
 		dod := delta - prevDelta
-		encodeDoD(w, dod)
+		encodeDoD(wTS, dod)
 		prevDelta = delta
 
 		curBits := math.Float64bits(points[i].Value)
-		prevBits, prevLZ, prevMBC, hasWindow = encodeXOR(w, curBits, prevBits, prevLZ, prevMBC, hasWindow)
+		prevBits, prevLZ, prevMBC, hasWindow = encodeXOR(wVal, curBits, prevBits, prevLZ, prevMBC, hasWindow)
 	}
 
-	return w.flush()
+	return EncodedStreams{
+		Timestamps: wTS.flush(),
+		Values:     wVal.flush(),
+	}
 }
 
 // encodeDoD writes a delta-of-delta using the Gorilla variable-length prefix scheme.
@@ -237,24 +248,21 @@ func encodeXOR(w *bitWriter, curBits, prevBits uint64, prevLZ, prevMBC uint, has
 // Decode
 // ══════════════════════════════════════════════════════════════════════════════
 
-func Decode(data []byte) ([]Point, error) {
-	if len(data) < 4 {
-		return nil, ErrInvalidHeader
-	}
-	count := int(binary.BigEndian.Uint32(data[:4]))
-	if count == 0 {
+func Decode(streams EncodedStreams, count int) ([]Point, error) {
+	if count <= 0 {
 		return nil, nil
 	}
 
-	r := newBitReader(data[4:])
+	rTS := newBitReader(streams.Timestamps)
+	rVal := newBitReader(streams.Values)
 	pts := make([]Point, 0, count)
 
 	// First point.
-	t0, err := r.readBits(64)
+	t0, err := rTS.readBits(64)
 	if err != nil {
 		return nil, ErrTruncatedInput
 	}
-	v0, err := r.readBits(64)
+	v0, err := rVal.readBits(64)
 	if err != nil {
 		return nil, ErrTruncatedInput
 	}
@@ -263,17 +271,17 @@ func Decode(data []byte) ([]Point, error) {
 		return pts, nil
 	}
 
-	// Second point: 32-bit signed delta.
-	rawD1, err := r.readBits(32)
+	// Second point: 64-bit signed delta.
+	rawD1, err := rTS.readBits(64)
 	if err != nil {
 		return nil, ErrTruncatedInput
 	}
-	delta1 := int64(int32(rawD1))
+	delta1 := int64(rawD1)
 	t1 := uint64(int64(t0) + delta1)
 
 	var prevLZ, prevMBC uint
 	var hasWindow bool
-	v1, lz, mbc, hw, err := decodeXOR(r, v0, prevLZ, prevMBC, hasWindow)
+	v1, lz, mbc, hw, err := decodeXOR(rVal, v0, prevLZ, prevMBC, hasWindow)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +296,7 @@ func Decode(data []byte) ([]Point, error) {
 	prevVBits := v1
 
 	for i := 2; i < count; i++ {
-		dod, err := decodeDoD(r)
+		dod, err := decodeDoD(rTS)
 		if err != nil {
 			return nil, err
 		}
@@ -297,7 +305,7 @@ func Decode(data []byte) ([]Point, error) {
 		prevDelta = delta
 		prevTS = ts
 
-		vBits, lz, mbc, hw, err := decodeXOR(r, prevVBits, prevLZ, prevMBC, hasWindow)
+		vBits, lz, mbc, hw, err := decodeXOR(rVal, prevVBits, prevLZ, prevMBC, hasWindow)
 		if err != nil {
 			return nil, err
 		}
@@ -436,6 +444,7 @@ func Benchmark() BenchmarkResult {
 	}
 	raw := n * 16
 	comp := Encode(pts)
-	ratio := float64(raw) / float64(len(comp))
-	return BenchmarkResult{RawBytes: raw, CompressedBytes: len(comp), Ratio: ratio}
+	compLen := len(comp.Timestamps) + len(comp.Values)
+	ratio := float64(raw) / float64(compLen)
+	return BenchmarkResult{RawBytes: raw, CompressedBytes: compLen, Ratio: ratio}
 }

@@ -67,17 +67,23 @@ cd backend
 # Run all unit tests and compression benchmarks
 go test -v ./...
 
-# Start the Chronos server (defaults: TCP on :9000, WebSocket on :9001, data in ./chronos_data)
+# Start the Chronos server with live API ingestion (weather, crypto, forex)
 go run main.go
 
-# (Optional) Run with custom data directory or flags
-go run main.go -data /path/to/data
+# (Option A) Run with synthetic demo mode (offline, zero network required)
+go run main.go -demo
+# OR via environment variable:
+CHRONOS_DEMO_MODE=1 go run main.go
+
+# (Option B) Run with custom data directory or disable ingestion
+go run main.go -data /path/to/data -ingest=false
 ```
 
 Once running:
 - **TCP Server**: `localhost:9000` (for CLI / telemetry ingest)
 - **WebSocket Gateway**: `ws://localhost:9001/ws` (for the browser dashboard)
 - **Health Check**: `http://localhost:9001/health`
+- **Graceful Shutdown**: Pressing `Ctrl+C` (SIGINT/SIGTERM) automatically flushes all in-memory series buffers and finalizes open hourly rollup accumulators to disk before exiting.
 
 ---
 
@@ -100,7 +106,7 @@ python -m http.server 8080
 # Open http://localhost:8080 in your browser
 ```
 
-> **Note**: The UI features an automatic fallback **Simulation Demo Mode** if the Go backend is not connected, allowing full inspection of features offline.
+> **Note**: The backend supports offline **Synthetic Demo Mode** (`-demo` or `CHRONOS_DEMO_MODE=1`) which feeds deterministic sinusoidal data through the exact same storage and alert evaluation path without needing internet connectivity. The UI also features an automatic fallback **Simulation Demo Mode** if the Go backend is not connected.
 
 ---
 
