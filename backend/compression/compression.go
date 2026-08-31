@@ -428,15 +428,10 @@ func Benchmark() BenchmarkResult {
 	// Values change by ~0.01-0.1 per sample, sharing exponent bits → high XOR reuse.
 	for i := range pts {
 		// sin oscillation: period ~1h, amplitude 2.0, baseline 70.0
-		phase := float64(i) * 2.0 * 3.141592653589793 / 3600.0
-		// Use a simple Taylor approximation to avoid importing math.Sin
-		// sin(x) ≈ x - x³/6 + x⁵/120 for small x; for larger x use modular trick:
-		// We only need the pattern, not exact trig.
-		p := phase - float64(int64(phase/(2*3.141592653589793)))*2*3.141592653589793
-		s := p * (1 - p*p/6.0*(1-p*p/20.0)) // sin approximation for p in [-π,π]
+		phase := float64(i) * 2.0 * math.Pi / 3600.0
 		pts[i] = Point{
 			TS:    uint64(1_735_000_000 + i),
-			Value: 70.0 + 2.0*s,
+			Value: 70.0 + 2.0*math.Sin(phase),
 		}
 	}
 	raw := n * 16

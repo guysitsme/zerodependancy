@@ -244,6 +244,10 @@ func (e *Engine) Query(series string, start, end uint64) (QueryResult, error) {
 		allPoints = append(allPoints, pts...)
 	}
 
+	// Merge unrotated in-memory buffer points
+	bufPts := e.store.GetBufferedPoints(series)
+	allPoints = append(allPoints, bufPts...)
+
 	// Filter to exact range.
 	filtered := allPoints[:0]
 	for _, p := range allPoints {
@@ -252,6 +256,11 @@ func (e *Engine) Query(series string, start, end uint64) (QueryResult, error) {
 		}
 	}
 	return QueryResult{Tier: TierRaw, Raw: filtered}, nil
+}
+
+// GetAllSeriesMeta returns metadata across all series in the engine.
+func (e *Engine) GetAllSeriesMeta() []persistence.SeriesMeta {
+	return e.store.GetAllSeriesMeta()
 }
 
 // ── Rollup file helpers ───────────────────────────────────────────────────────

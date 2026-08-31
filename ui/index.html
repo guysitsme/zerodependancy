@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <meta name="description" content="Chronos Operator Dashboard — Zero-dependency time-series database interface for writing, querying, and tailing real-time data."/>
+  <meta name="description" content="Chronos Operator Dashboard — Zero-dependency time-series database with real-time ingestion, WebSocket streaming, and REST API."/>
   <title>Chronos — Operator Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="style.css"/>
@@ -15,7 +15,22 @@
 ════════════════════════════════════════════ -->
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
-    <h1 class="logo">Chronos</h1>
+    <div class="logo-row">
+      <h1 class="logo">Chronos</h1>
+      <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark/light mode" title="Toggle theme">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/>
+          <line x1="12" y1="1" x2="12" y2="3"/>
+          <line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1" y1="12" x2="3" y2="12"/>
+          <line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
     <div class="connection-status" id="connectionStatus">
       <span class="status-dot" id="statusDot"></span>
       <span class="status-label" id="statusLabel">Disconnected</span>
@@ -52,7 +67,25 @@
     <a href="#benchmark" class="nav-link" data-section="benchmark">
       <span class="nav-icon">&#x25C8;</span> Benchmark
     </a>
+    <a href="#series-browser" class="nav-link" data-section="series-browser">
+      <span class="nav-icon">&#x2261;</span> Series
+    </a>
+    <a href="#alerts" class="nav-link" data-section="alerts">
+      <span class="nav-icon">&#x26A0;</span> Alerts
+    </a>
+    <a href="#server-info" class="nav-link" data-section="server-info">
+      <span class="nav-icon">&#x2699;</span> Server
+    </a>
   </nav>
+
+  <div class="ingest-status" id="ingestStatus">
+    <div class="ingest-title">LIVE INGEST</div>
+    <div class="ingest-feeds" id="ingestFeeds">
+      <div class="ingest-feed" id="feed-weather"><span class="feed-dot"></span>Weather</div>
+      <div class="ingest-feed" id="feed-crypto"><span class="feed-dot"></span>Crypto</div>
+      <div class="ingest-feed" id="feed-forex"><span class="feed-dot"></span>Forex</div>
+    </div>
+  </div>
 
   <div class="sidebar-footer">
     <button class="btn-secondary w-full" id="connectBtn">Connect</button>
@@ -71,6 +104,21 @@
      MAIN CONTENT
 ════════════════════════════════════════════ -->
 <main class="main-content">
+
+  <!-- ─── ACTIVE ALERT BANNER ─── -->
+  <div class="alert-banner" id="alertBanner" style="display:none">
+    <div class="alert-banner-left">
+      <span class="alert-pulse-icon">&#x26A0;</span>
+      <div>
+        <strong id="alertBannerTitle">Threshold Breach Detected</strong>
+        <div class="alert-banner-desc mono text-sm" id="alertBannerDesc">btc_usd breached threshold: 80500 > 80000</div>
+      </div>
+    </div>
+    <div class="alert-banner-right">
+      <button class="btn-ghost-light" id="alertSoundToggle" title="Toggle Sound Chime">&#x1F50A; Sound On</button>
+      <button class="btn-ghost-light" id="alertBannerDismiss">Dismiss</button>
+    </div>
+  </div>
 
   <!-- ─── WRITE PANEL ─── -->
   <section class="card" id="write">
@@ -145,7 +193,12 @@
         <h2 class="section-title">Query</h2>
         <span class="badge" id="queryTierBadge" style="display:none">&#x2013;</span>
       </div>
-      <button class="btn-primary" id="queryBtn">Query</button>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn-ghost" id="liveRefreshBtn" title="Live chart refresh every 5s">&#x25B6; Live</button>
+        <button class="btn-ghost" id="exportCsvBtn" title="Export as CSV">&#x21E9; CSV</button>
+        <button class="btn-ghost" id="exportJsonBtn" title="Export as JSON">&#x21E9; JSON</button>
+        <button class="btn-primary" id="queryBtn">Query</button>
+      </div>
     </div>
 
     <div class="query-form">
@@ -161,6 +214,11 @@
         <label class="form-label">End (Epoch)</label>
         <input id="queryEnd" class="input-base mono" type="text" placeholder="1735086400"/>
       </div>
+    </div>
+
+    <!-- Live refresh indicator -->
+    <div class="live-badge" id="liveRefreshBadge" style="display:none">
+      <span class="pulse-dot"></span> Live — refreshing every 5s
     </div>
 
     <!-- Chart -->
@@ -194,6 +252,134 @@
     </div>
     <div class="terminal-body" id="tailOutput">
       <div class="terminal-placeholder">// Connect and start tailing a series to see live data stream here</div>
+    </div>
+  </section>
+
+  <!-- ─── SERIES BROWSER PANEL ─── -->
+  <section class="card full-width" id="series-browser">
+    <div class="card-header">
+      <h2 class="section-title">Series Browser</h2>
+      <button class="btn-ghost" id="refreshSeriesBtn">&#x21BB; Refresh</button>
+    </div>
+    <div id="seriesBrowserLoading" class="empty-state">Connect to server to load series...</div>
+    <div id="seriesBrowserGrid" class="series-grid" style="display:none"></div>
+  </section>
+
+  <!-- ─── ALERTS PANEL ─── -->
+  <section class="card full-width" id="alerts">
+    <div class="card-header">
+      <div class="header-left">
+        <h2 class="section-title">Threshold Alerts</h2>
+        <span class="badge" id="alertsActiveBadge">0 RULES</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn-ghost" id="alertNotifyPermBtn" title="Enable browser push notifications">&#x1F514; Enable Notifications</button>
+        <button class="btn-ghost" id="alertTestBtn" title="Send a test alert">&#x25B6; Test Alert</button>
+        <button class="btn-ghost" id="refreshAlertsBtn">&#x21BB; Refresh</button>
+      </div>
+    </div>
+
+    <!-- Alert Rule Creator -->
+    <div class="alert-creator">
+      <h3 class="subsection-title">Create Alert Rule</h3>
+      <div class="alert-form-grid">
+        <div class="form-group">
+          <label class="form-label">Series</label>
+          <input id="alertRuleSeries" class="input-base mono" type="text" placeholder="e.g. btc_usd, cpu_usage"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Condition</label>
+          <div class="select-wrapper">
+            <select id="alertRuleOp" class="input-base mono">
+              <option value=">">&gt; Greater than</option>
+              <option value="<">&lt; Less than</option>
+              <option value=">=">&gt;= Greater or equal</option>
+              <option value="<=">&lt;= Less or equal</option>
+              <option value="==">== Equal to</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Threshold Value</label>
+          <input id="alertRuleThreshold" class="input-base mono" type="number" step="any" placeholder="80000"/>
+        </div>
+        <div class="form-group alert-btn-group">
+          <label class="form-label">&nbsp;</label>
+          <button class="btn-primary w-full" id="addAlertRuleBtn">+ Add Rule</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Active Rules & Triggers Subgrid -->
+    <div class="alert-subgrid">
+      <div class="alert-subcol">
+        <h3 class="subsection-title">Active Alert Rules</h3>
+        <div class="table-scroll" id="alertRulesTableWrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Series</th>
+                <th>Condition</th>
+                <th class="num">Threshold</th>
+                <th class="num">Action</th>
+              </tr>
+            </thead>
+            <tbody id="alertRulesTableBody">
+              <tr><td colspan="5" class="empty-cell">Loading rules...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="alert-subcol">
+        <h3 class="subsection-title">Recent Trigger Events</h3>
+        <div class="table-scroll" id="alertTriggersTableWrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Series</th>
+                <th class="num">Breached Value</th>
+                <th>Condition</th>
+              </tr>
+            </thead>
+            <tbody id="alertTriggersTableBody">
+              <tr><td colspan="4" class="empty-cell">No alert events recorded yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── SERVER INFO PANEL ─── -->
+  <section class="card full-width" id="server-info">
+    <div class="card-header">
+      <h2 class="section-title">Server Info</h2>
+      <button class="btn-ghost" id="refreshStatsBtn">&#x21BB; Refresh</button>
+    </div>
+    <div class="server-stats-grid">
+      <div class="stat-card">
+        <span class="stat-label">Series Count</span>
+        <span class="stat-value mono" id="statSeriesCount">&#x2013;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Total Disk</span>
+        <span class="stat-value mono" id="statDiskBytes">&#x2013;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Uptime</span>
+        <span class="stat-value mono" id="statUptime">&#x2013;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">TCP Port</span>
+        <span class="stat-value mono" id="statTcpPort">&#x2013;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">WS Port</span>
+        <span class="stat-value mono" id="statWsPort">&#x2013;</span>
+      </div>
     </div>
   </section>
 

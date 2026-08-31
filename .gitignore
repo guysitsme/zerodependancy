@@ -1,0 +1,24 @@
+# Binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend/chronos.exe
+
+# Test binaries
+*.test
+
+# Runtime data directories
+data/
+backend/data/
+chronos_data/
+*.dat
+*.tmp
+*.log
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

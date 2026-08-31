@@ -52,10 +52,10 @@ type IndexEntry struct {
 type Store struct {
 	dataDir string
 
-	// per-series write lock (only one writer per series at a time)
-	writeMu sync.Mutex
+	// per-series write locks — concurrent writes to different series never block.
+	seriesLocks sync.Map // map[string]*sync.Mutex
 
-	// per-series in-memory write buffer (unprotected — only the writer touches it)
+	// per-series in-memory write buffer (protected by per-series lock)
 	buffers map[string][]compression.Point
 
 	// per-series next chunk ID counter
@@ -65,6 +65,9 @@ type Store struct {
 	// Readers take an atomic load; writer does a full swap after building a
 	// new copy — no reader ever blocks another.
 	indexPtr unsafe.Pointer // *map[string][]IndexEntry
+
+	// global lock for index swaps and nextID counter
+	indexMu sync.Mutex
 }
 
 // Open opens (or creates) the store rooted at dataDir.
@@ -108,9 +111,25 @@ func (s *Store) swapIndex(m map[string][]IndexEntry) {
 // WritePoint appends a (timestamp, value) point to the named series.
 // It is safe to call from multiple goroutines for different series;
 // concurrent writes to the SAME series are serialised by writeMu.
+// seriesMu returns the per-series mutex, creating one if needed.
+func (s *Store) seriesMu(series string) *sync.Mutex {
+	if v, ok := s.seriesLocks.Load(series); ok {
+		return v.(*sync.Mutex)
+	}
+	mu := &sync.Mutex{}
+	actual, _ := s.seriesLocks.LoadOrStore(series, mu)
+	return actual.(*sync.Mutex)
+}
+
 func (s *Store) WritePoint(series string, ts uint64, value float64) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	mu := s.seriesMu(series)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// ── 1. Write-Ahead Log (WAL) for 100% crash durability
+	if err := AppendWAL(s.dataDir, series, ts, value); err != nil {
+		return err
+	}
 
 	buf := s.buffers[series]
 	buf = append(buf, compression.Point{TS: ts, Value: value})
@@ -188,6 +207,7 @@ func (s *Store) rotate(series string) error {
 	}
 
 	// Build new index snapshot and publish it atomically.
+	s.indexMu.Lock()
 	oldIdx := s.loadIndex()
 	newIdx := make(map[string][]IndexEntry, len(oldIdx)+1)
 	for k, v := range oldIdx {
@@ -203,10 +223,15 @@ func (s *Store) rotate(series string) error {
 
 	// Persist index.dat atomically.
 	if err := s.writeIndexFile(series, seriesDir, newIdx[series]); err != nil {
+		s.indexMu.Unlock()
 		return err
 	}
 	s.swapIndex(newIdx)
+	s.indexMu.Unlock()
 	s.buffers[series] = s.buffers[series][:0]
+
+	// ── 2. Truncate WAL now that points are committed to compressed chunk
+	_ = TruncateWAL(s.dataDir, series)
 	return nil
 }
 
@@ -329,6 +354,11 @@ func (s *Store) rebuildIndex() (map[string][]IndexEntry, error) {
 				}
 			}
 		}
+
+		// ── 3. Replay unrotated WAL points on startup/recovery
+		if unrotated, err := RecoverWAL(s.dataDir, series); err == nil && len(unrotated) > 0 {
+			s.buffers[series] = unrotated
+		}
 	}
 	return idx, nil
 }
@@ -411,7 +441,109 @@ func (s *Store) scanChunkHeaders(series, seriesDir string) ([]IndexEntry, error)
 // FlushSeries force-rotates the active buffer for a series, writing any
 // buffered points to disk. Used at shutdown or by tests.
 func (s *Store) FlushSeries(series string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	mu := s.seriesMu(series)
+	mu.Lock()
+	defer mu.Unlock()
 	return s.rotate(series)
 }
+
+// GetBufferedPoints returns a snapshot copy of any points currently held in memory
+// for the given series that have not yet been rotated to a chunk file.
+func (s *Store) GetBufferedPoints(series string) []compression.Point {
+	mu := s.seriesMu(series)
+	mu.Lock()
+	defer mu.Unlock()
+	buf := s.buffers[series]
+	if len(buf) == 0 {
+		return nil
+	}
+	cp := make([]compression.Point, len(buf))
+	copy(cp, buf)
+	return cp
+}
+
+// SeriesMeta holds aggregated storage and activity information for one series.
+type SeriesMeta struct {
+	Name        string
+	PointCount  int64
+	DiskBytes   int64
+	LastUpdated int64
+}
+
+// GetAllSeriesMeta returns metadata for all series (both in-memory buffers and on-disk chunks).
+// FlushAllSeries force-rotates all active buffers. Used for graceful shutdown.
+func (s *Store) FlushAllSeries() {
+	// Collect series names from buffers
+	var names []string
+	s.seriesLocks.Range(func(key, _ any) bool {
+		names = append(names, key.(string))
+		return true
+	})
+	for _, name := range names {
+		_ = s.FlushSeries(name)
+	}
+}
+
+func (s *Store) GetAllSeriesMeta() []SeriesMeta {
+	seriesNames := make(map[string]struct{})
+	// Scan buffers — iterate keys safely
+	s.seriesLocks.Range(func(key, _ any) bool {
+		seriesNames[key.(string)] = struct{}{}
+		return true
+	})
+
+	idx := s.loadIndex()
+	for k := range idx {
+		seriesNames[k] = struct{}{}
+	}
+
+	// Also scan directory
+	entries, _ := os.ReadDir(s.dataDir)
+	for _, e := range entries {
+		if e.IsDir() {
+			seriesNames[e.Name()] = struct{}{}
+		}
+	}
+
+	var list []SeriesMeta
+	for name := range seriesNames {
+		meta := SeriesMeta{Name: name}
+
+		// Add in-memory points
+		bufPts := s.GetBufferedPoints(name)
+		meta.PointCount += int64(len(bufPts))
+		if len(bufPts) > 0 {
+			meta.LastUpdated = int64(bufPts[len(bufPts)-1].TS)
+		}
+
+		// Add disk chunks from index
+		if chunks, ok := idx[name]; ok {
+			for _, ch := range chunks {
+				meta.PointCount += int64(ch.PointCount)
+				if int64(ch.EndTime) > meta.LastUpdated {
+					meta.LastUpdated = int64(ch.EndTime)
+				}
+			}
+		}
+
+		// Disk bytes from series directory
+		seriesDir := filepath.Join(s.dataDir, name)
+		files, _ := os.ReadDir(seriesDir)
+		for _, f := range files {
+			if fi, err := f.Info(); err == nil {
+				meta.DiskBytes += fi.Size()
+				if meta.LastUpdated == 0 && fi.ModTime().Unix() > meta.LastUpdated {
+					meta.LastUpdated = fi.ModTime().Unix()
+				}
+			}
+		}
+
+		list = append(list, meta)
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
+	return list
+}
+

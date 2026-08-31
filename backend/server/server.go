@@ -18,7 +18,7 @@ import (
 	"chronos/rollup"
 )
 
-// ── Subscriber map (TAIL) ─────────────────────────────────────────────────────
+// ── Subscriber map (TAIL & ALERT) ─────────────────────────────────────────────
 
 type subscriber struct {
 	conn net.Conn
@@ -28,10 +28,14 @@ type subscriber struct {
 type broker struct {
 	mu   sync.Mutex
 	subs map[string][]*subscriber
+	all  []*subscriber
 }
 
 func newBroker() *broker {
-	return &broker{subs: make(map[string][]*subscriber)}
+	return &broker{
+		subs: make(map[string][]*subscriber),
+		all:  make([]*subscriber, 0),
+	}
 }
 
 func (b *broker) register(series string, s *subscriber) {
@@ -47,6 +51,23 @@ func (b *broker) unregister(series string, s *subscriber) {
 	for i, sub := range list {
 		if sub == s {
 			b.subs[series] = append(list[:i], list[i+1:]...)
+			return
+		}
+	}
+}
+
+func (b *broker) registerClient(s *subscriber) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.all = append(b.all, s)
+}
+
+func (b *broker) unregisterClient(s *subscriber) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, sub := range b.all {
+		if sub == s {
+			b.all = append(b.all[:i], b.all[i+1:]...)
 			return
 		}
 	}
@@ -72,6 +93,27 @@ func (b *broker) Notify(series string, ts uint64, value float64) {
 	b.subs[series] = alive
 }
 
+// BroadcastAlert broadcasts an ALERT event line to all connected clients.
+func (b *broker) BroadcastAlert(trig AlertTrigger) {
+	line := fmt.Sprintf("ALERT %s,%s,%.6g,%s,%.6g,%d\n",
+		trig.RuleID, trig.Series, trig.Value, trig.Operator, trig.Threshold, trig.Timestamp)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	alive := b.all[:0]
+	for _, sub := range b.all {
+		if _, err := sub.w.WriteString(line); err != nil {
+			sub.conn.Close()
+			continue
+		}
+		if err := sub.w.Flush(); err != nil {
+			sub.conn.Close()
+			continue
+		}
+		alive = append(alive, sub)
+	}
+	b.all = alive
+}
+
 // ── TCP Server ────────────────────────────────────────────────────────────────
 
 var seriesRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
@@ -80,11 +122,28 @@ var seriesRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 type TCPServer struct {
 	engine *rollup.Engine
 	broker *broker
+	alerts *AlertManager
 }
 
-// NewTCPServer constructs a TCPServer backed by the given Engine.
-func NewTCPServer(engine *rollup.Engine) *TCPServer {
-	return &TCPServer{engine: engine, broker: newBroker()}
+// NewTCPServer constructs a TCPServer backed by the given Engine and persistence dataDir.
+func NewTCPServer(engine *rollup.Engine, dataDir string) *TCPServer {
+	b := newBroker()
+	am := NewAlertManager(dataDir, func(trig AlertTrigger) {
+		b.BroadcastAlert(trig)
+	})
+	return &TCPServer{engine: engine, broker: b, alerts: am}
+}
+
+// WritePoint writes a point to the engine, notifies TAIL subscribers, and evaluates alerts.
+func (srv *TCPServer) WritePoint(series string, ts uint64, value float64) error {
+	if err := srv.engine.WritePoint(series, ts, value); err != nil {
+		return err
+	}
+	srv.broker.Notify(series, ts, value)
+	if srv.alerts != nil {
+		srv.alerts.Check(series, ts, value)
+	}
+	return nil
 }
 
 // ListenAndServe blocks, accepting connections on config.TCPPort.
@@ -108,6 +167,10 @@ func (srv *TCPServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	w := bufio.NewWriter(conn)
+
+	sub := &subscriber{conn: conn, w: w}
+	srv.broker.registerClient(sub)
+	defer srv.broker.unregisterClient(sub)
 
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -166,12 +229,10 @@ func (srv *TCPServer) handleWrite(parts []string, w *bufio.Writer) {
 		fmt.Fprintln(w, "ERR invalid value: not a number")
 		return
 	}
-	if err := srv.engine.WritePoint(series, ts, value); err != nil {
+	if err := srv.WritePoint(series, ts, value); err != nil {
 		fmt.Fprintf(w, "ERR %v\n", err)
 		return
 	}
-	// Notify TAIL subscribers.
-	srv.broker.Notify(series, ts, value)
 	fmt.Fprintln(w, "OK")
 }
 
@@ -256,21 +317,43 @@ func (srv *TCPServer) handleBenchmark(w *bufio.Writer) {
 
 // WSServer wraps TCPServer to serve the same protocol over WebSocket.
 type WSServer struct {
-	tcp *TCPServer
+	tcp     *TCPServer
+	dataDir string
 }
 
 // NewWSServer creates a WebSocket gateway backed by the same engine as srv.
-func NewWSServer(tcp *TCPServer) *WSServer { return &WSServer{tcp: tcp} }
+func NewWSServer(tcp *TCPServer, dataDir string) *WSServer {
+	return &WSServer{tcp: tcp, dataDir: dataDir}
+}
 
-// ListenAndServe blocks on config.WSPort serving the WebSocket upgrade handler.
+// ListenAndServe blocks on config.WSPort serving the WebSocket upgrade handler,
+// REST API endpoints, and UI static files.
 func (ws *WSServer) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ws.handleUpgrade)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		fmt.Fprintln(w, "OK")
 	})
-	fmt.Fprintf(os.Stdout, "Chronos WebSocket gateway listening on %s\n", config.WSPort)
+
+	// ── REST API routes (/api/v1/*)
+	registerRESTRoutes(mux, ws.tcp, ws.dataDir)
+
+	// ── Serve UI static files if the ui directory is found
+	uiCandidates := []string{"ui", "../ui", "../../ui"}
+	for _, dir := range uiCandidates {
+		if stat, err := os.Stat(dir); err == nil && stat.IsDir() {
+			if _, err := os.Stat(dir + "/index.html"); err == nil {
+				fs := http.FileServer(http.Dir(dir))
+				mux.Handle("/", fs)
+				fmt.Fprintf(os.Stdout, "Chronos Dashboard UI served from %s on http://localhost%s\n", dir, config.WSPort)
+				break
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stdout, "Chronos WebSocket gateway + REST API listening on %s\n", config.WSPort)
 	return http.ListenAndServe(config.WSPort, mux)
 }
 

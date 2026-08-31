@@ -17,6 +17,11 @@ const state = {
   queryMode: 'raw',
   pendingQueryCallback: null,
   queryBuffer: [],
+  // Live refresh
+  liveRefreshTimer: null,
+  liveRefreshActive: false,
+  // Dark mode
+  theme: localStorage.getItem('chronos-theme') || 'dark',
 };
 
 // In-memory demo store (used when offline/demo mode)
@@ -75,6 +80,29 @@ const compRatioEl         = document.getElementById('compRatio');
 const efficiencyBar       = document.getElementById('efficiencyBar');
 const efficiencyLabel     = document.getElementById('efficiencyLabel');
 
+// Series browser panel
+const seriesBrowserGrid   = document.getElementById('seriesBrowserGrid');
+const seriesBrowserLoading= document.getElementById('seriesBrowserLoading');
+const refreshSeriesBtn    = document.getElementById('refreshSeriesBtn');
+
+// Server info panel
+const refreshStatsBtn     = document.getElementById('refreshStatsBtn');
+const statSeriesCount     = document.getElementById('statSeriesCount');
+const statDiskBytes       = document.getElementById('statDiskBytes');
+const statUptime          = document.getElementById('statUptime');
+const statTcpPort         = document.getElementById('statTcpPort');
+const statWsPort          = document.getElementById('statWsPort');
+
+// Ingest feeds & Live refresh & Export
+const feedWeather         = document.getElementById('feed-weather');
+const feedCrypto          = document.getElementById('feed-crypto');
+const feedForex           = document.getElementById('feed-forex');
+const liveRefreshBtn      = document.getElementById('liveRefreshBtn');
+const liveRefreshBadge    = document.getElementById('liveRefreshBadge');
+const exportCsvBtn        = document.getElementById('exportCsvBtn');
+const exportJsonBtn       = document.getElementById('exportJsonBtn');
+const themeToggle         = document.getElementById('themeToggle');
+
 // Error log
 const errorLog            = document.getElementById('errorLog');
 const errorMessage        = document.getElementById('errorMessage');
@@ -110,21 +138,36 @@ function setConnectionState(connected, isLive = false) {
       ? `Live: ${state.serverHost}` 
       : `Demo Mode (Simulated)`;
     connectBtn.textContent = 'Disconnect';
+    // Trigger immediate refresh of series, stats & alerts
+    setTimeout(() => {
+      if (typeof fetchSeriesList === 'function') fetchSeriesList();
+      if (typeof fetchServerStats === 'function') fetchServerStats();
+      if (typeof fetchAlerts === 'function') fetchAlerts();
+    }, 100);
   } else {
     statusLabel.textContent = 'Disconnected';
     connectBtn.textContent = 'Connect';
   }
 }
 
+function getDefaultHost() {
+  if (typeof window !== 'undefined' && window.location && window.location.host && window.location.protocol.startsWith('http')) {
+    return window.location.host;
+  }
+  return 'localhost:9001';
+}
+
 function getWebSocketUrl(hostInput) {
-  let host = hostInput.trim();
-  if (!host) host = 'localhost:9001';
-  // Strip http:// or https:// or ws://
+  let host = (hostInput || '').trim();
+  if (!host) host = getDefaultHost();
+  const isSecure = (typeof window !== 'undefined' && window.location && window.location.protocol === 'https:');
+  const proto = isSecure ? 'wss://' : 'ws://';
+  // Strip http://, https://, ws://, wss://
   host = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '');
   if (!host.includes('/')) {
     host = `${host}/ws`;
   }
-  return `ws://${host}`;
+  return `${proto}${host}`;
 }
 
 // ─── Active series sync ───────────────────────────────────────────────────────
@@ -271,6 +314,15 @@ function handleServerMessage(data) {
         showError(line);
       } else {
         state.queryBuffer.push(line);
+      }
+      continue;
+    }
+
+    // Alert broadcasts
+    if (line.startsWith('ALERT ')) {
+      const alert = parseAlertLine(line);
+      if (alert) {
+        showAlertBanner(alert.series, alert.value, alert.operator, alert.threshold);
       }
       continue;
     }
@@ -652,8 +704,16 @@ function drawChart(results, tier) {
   const maxVal = Math.max(...values);
   const valRange = maxVal - minVal || 1;
 
+  // Theme-aware chart colours — read from CSS custom properties
+  const cs = getComputedStyle(document.documentElement);
+  const gridColor   = cs.getPropertyValue('--border-color').trim() || '#EBEBEB';
+  const lineColor   = cs.getPropertyValue('--accent').trim() || '#2B2B2B';
+  const labelColor  = cs.getPropertyValue('--text-secondary').trim() || '#747878';
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const fillAlpha = isDark ? 0.12 : 0.06;
+
   // Gridlines
-  ctx.strokeStyle = '#EBEBEB';
+  ctx.strokeStyle = gridColor;
   ctx.lineWidth = 1;
   const gridLines = 4;
   for (let i = 0; i <= gridLines; i++) {
@@ -664,7 +724,7 @@ function drawChart(results, tier) {
     ctx.stroke();
 
     const label = (maxVal - (i / gridLines) * valRange).toFixed(1);
-    ctx.fillStyle = '#747878';
+    ctx.fillStyle = labelColor;
     ctx.font = '10px JetBrains Mono, monospace';
     ctx.textAlign = 'right';
     ctx.fillText(label, PAD.left - 6, y + 4);
@@ -682,7 +742,12 @@ function drawChart(results, tier) {
   pts.forEach(p => ctx.lineTo(p.x, p.y));
   ctx.lineTo(pts[pts.length - 1].x, PAD.top + plotH);
   ctx.closePath();
-  ctx.fillStyle = 'rgba(43,43,43,0.06)';
+  // Parse lineColor hex to rgba for fill
+  const hex = lineColor.replace('#', '');
+  const r = parseInt(hex.substring(0,2), 16) || 43;
+  const g = parseInt(hex.substring(2,4), 16) || 43;
+  const b = parseInt(hex.substring(4,6), 16) || 43;
+  ctx.fillStyle = `rgba(${r},${g},${b},${fillAlpha})`;
   ctx.fill();
 
   // Line
@@ -692,7 +757,7 @@ function drawChart(results, tier) {
     const cpx = (pts[i - 1].x + pts[i].x) / 2;
     ctx.bezierCurveTo(cpx, pts[i - 1].y, cpx, pts[i].y, pts[i].x, pts[i].y);
   }
-  ctx.strokeStyle = '#2B2B2B';
+  ctx.strokeStyle = lineColor;
   ctx.lineWidth = 1.5;
   ctx.lineJoin = 'round';
   ctx.stroke();
@@ -701,7 +766,7 @@ function drawChart(results, tier) {
   pts.forEach(p => {
     ctx.beginPath();
     ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
-    ctx.fillStyle = '#2B2B2B';
+    ctx.fillStyle = lineColor;
     ctx.fill();
   });
 
@@ -710,7 +775,7 @@ function drawChart(results, tier) {
   const xIndices = [0, Math.floor((tsArr.length - 1) / 2), tsArr.length - 1];
   xIndices.forEach(i => {
     if (i >= 0 && i < tsArr.length) {
-      ctx.fillStyle = '#747878';
+      ctx.fillStyle = labelColor;
       ctx.font = '10px JetBrains Mono, monospace';
       ctx.textAlign = i === 0 ? 'left' : i === tsArr.length - 1 ? 'right' : 'center';
       ctx.fillText(tsArr[i], pts[i].x, H - 6);
@@ -859,12 +924,517 @@ function renderBenchmarkStats(rawBytes, compBytes, ratio) {
   runBenchmarkBtn.disabled = false;
 }
 
+// ─── Theme Toggle ────────────────────────────────────────────────────────────
+function applyTheme(theme) {
+  state.theme = theme;
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('chronos-theme', theme);
+  if (state.queryResults && state.queryResults.length > 0) {
+    drawChart(state.queryResults, state.queryMode);
+  }
+}
+
+if (themeToggle) {
+  themeToggle.addEventListener('click', () => {
+    const nextTheme = state.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(nextTheme);
+  });
+}
+
+// ─── Live Chart Auto-Refresh ──────────────────────────────────────────────────
+if (liveRefreshBtn) {
+  liveRefreshBtn.addEventListener('click', toggleLiveRefresh);
+}
+
+function toggleLiveRefresh() {
+  state.liveRefreshActive = !state.liveRefreshActive;
+  if (state.liveRefreshActive) {
+    liveRefreshBtn.textContent = '⏹ Stop Live';
+    liveRefreshBtn.classList.add('active');
+    if (liveRefreshBadge) liveRefreshBadge.style.display = 'flex';
+    // Trigger immediate query then every 5s
+    triggerLiveRefreshQuery();
+    state.liveRefreshTimer = setInterval(triggerLiveRefreshQuery, 5000);
+  } else {
+    liveRefreshBtn.textContent = '▶ Live';
+    liveRefreshBtn.classList.remove('active');
+    if (liveRefreshBadge) liveRefreshBadge.style.display = 'none';
+    if (state.liveRefreshTimer) {
+      clearInterval(state.liveRefreshTimer);
+      state.liveRefreshTimer = null;
+    }
+  }
+}
+
+function triggerLiveRefreshQuery() {
+  const series = querySeriesInput.value.trim() || state.activeSeries;
+  const now = nowEpoch();
+  const start = now - 3600; // last 1 hour
+  queryStartInput.value = start;
+  queryEndInput.value = now;
+  runQuery(series, start, now);
+}
+
+// ─── Data Export (CSV & JSON) ────────────────────────────────────────────────
+if (exportCsvBtn) {
+  exportCsvBtn.addEventListener('click', () => exportData('csv'));
+}
+if (exportJsonBtn) {
+  exportJsonBtn.addEventListener('click', () => exportData('json'));
+}
+
+function exportData(format) {
+  const series = querySeriesInput.value.trim() || state.activeSeries;
+  const start = parseInt(queryStartInput.value.trim()) || (nowEpoch() - 3600);
+  const end   = parseInt(queryEndInput.value.trim()) || nowEpoch();
+
+  if (state.isLive) {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    const url = `${proto}${cleanHost}/api/v1/export?series=${encodeURIComponent(series)}&start=${start}&end=${end}&format=${format}`;
+    window.open(url, '_blank');
+  } else {
+    // Client-side export fallback in demo mode
+    const data = state.queryResults || [];
+    let blob;
+    if (format === 'json') {
+      blob = new Blob([JSON.stringify({ series, start, end, points: data }, null, 2)], { type: 'application/json' });
+    } else {
+      let csv = 'timestamp,value\n';
+      data.forEach(p => { csv += `${p.ts || p.window_start},${p.value || p.avg}\n`; });
+      blob = new Blob([csv], { type: 'text/csv' });
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `chronos_${series}_${start}_${end}.${format}`;
+    a.click();
+  }
+}
+
+// ─── Series Browser & Ingest Feeds ───────────────────────────────────────────
+if (refreshSeriesBtn) {
+  refreshSeriesBtn.addEventListener('click', fetchSeriesList);
+}
+
+async function fetchSeriesList() {
+  if (!state.isLive) {
+    renderSeriesGrid([
+      { name: 'engine_temp', point_count: 240, disk_bytes: 3840, last_updated_unix: nowEpoch() },
+      { name: 'cpu_usage',   point_count: 180, disk_bytes: 2880, last_updated_unix: nowEpoch() },
+      { name: 'mem_alloc',   point_count: 120, disk_bytes: 1920, last_updated_unix: nowEpoch() },
+    ]);
+    return;
+  }
+
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    const res = await fetch(`${proto}${cleanHost}/api/v1/series`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const seriesList = data.series || [];
+    renderSeriesGrid(seriesList);
+    updateGlobalSeriesOptions(seriesList);
+    updateIngestFeedStatus(seriesList);
+  } catch (err) {
+    if (seriesBrowserLoading) seriesBrowserLoading.textContent = `Error loading series: ${err.message}`;
+  }
+}
+
+function renderSeriesGrid(seriesList) {
+  if (!seriesBrowserGrid) return;
+  if (!seriesList || seriesList.length === 0) {
+    if (seriesBrowserLoading) {
+      seriesBrowserLoading.style.display = 'block';
+      seriesBrowserLoading.textContent = 'No series found on server yet. Write data or wait for ingestion.';
+    }
+    seriesBrowserGrid.style.display = 'none';
+    return;
+  }
+
+  if (seriesBrowserLoading) seriesBrowserLoading.style.display = 'none';
+  seriesBrowserGrid.style.display = 'grid';
+  seriesBrowserGrid.innerHTML = '';
+
+  seriesList.forEach(s => {
+    const card = document.createElement('div');
+    card.className = 'series-card';
+    card.title = `Click to select ${s.name}`;
+    card.innerHTML = `
+      <div class="series-card-name">${escapeHtml(s.name)}</div>
+      <div class="series-card-meta">
+        <div class="series-card-row"><span>Points</span><span>${s.point_count || '–'}</span></div>
+        <div class="series-card-row"><span>Size</span><span>${formatBytes(s.disk_bytes || 0)}</span></div>
+        <div class="series-card-row"><span>Updated</span><span>${s.last_updated_unix ? formatTimeAgo(s.last_updated_unix) : '–'}</span></div>
+      </div>
+    `;
+    card.addEventListener('click', () => {
+      selectSeries(s.name);
+    });
+    seriesBrowserGrid.appendChild(card);
+  });
+}
+
+function selectSeries(name) {
+  state.activeSeries = name;
+  if (globalSeriesSelect) globalSeriesSelect.value = name;
+  if (writeSeriesInput) writeSeriesInput.value = name;
+  if (querySeriesInput) querySeriesInput.value = name;
+  if (tailSeriesLabel) tailSeriesLabel.textContent = name;
+  // Trigger quick query for newly selected series
+  const now = nowEpoch();
+  queryStartInput.value = now - 3600;
+  queryEndInput.value = now;
+  runQuery(name, now - 3600, now);
+}
+
+function updateGlobalSeriesOptions(seriesList) {
+  if (!globalSeriesSelect) return;
+  const currentVal = globalSeriesSelect.value;
+  const names = new Set(seriesList.map(s => s.name));
+  names.add('engine_temp');
+  names.add('cpu_usage');
+  names.add('mem_alloc');
+
+  globalSeriesSelect.innerHTML = '';
+  Array.from(names).sort().forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === currentVal) opt.selected = true;
+    globalSeriesSelect.appendChild(opt);
+  });
+}
+
+function updateIngestFeedStatus(seriesList) {
+  const names = seriesList.map(s => s.name);
+  const hasWeather = names.some(n => n.startsWith('weather_'));
+  const hasCrypto  = names.some(n => n.startsWith('btc_') || n.startsWith('eth_'));
+  const hasForex   = names.some(n => n.startsWith('forex_'));
+
+  if (feedWeather) feedWeather.className = 'ingest-feed' + (hasWeather ? ' active' : '');
+  if (feedCrypto)  feedCrypto.className  = 'ingest-feed' + (hasCrypto ? ' active' : '');
+  if (feedForex)   feedForex.className   = 'ingest-feed' + (hasForex ? ' active' : '');
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>'"]/g, tag => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  }[tag] || tag));
+}
+
+function formatTimeAgo(ts) {
+  const diff = nowEpoch() - ts;
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
+}
+
+// ─── Server Info Panel ────────────────────────────────────────────────────────
+if (refreshStatsBtn) {
+  refreshStatsBtn.addEventListener('click', fetchServerStats);
+}
+
+async function fetchServerStats() {
+  if (!state.isLive) {
+    if (statSeriesCount) statSeriesCount.textContent = '3 (Demo)';
+    if (statDiskBytes)   statDiskBytes.textContent   = '8.6 KB';
+    if (statUptime)      statUptime.textContent      = '12m 45s';
+    if (statTcpPort)     statTcpPort.textContent     = ':9000';
+    if (statWsPort)      statWsPort.textContent      = ':9001';
+    return;
+  }
+
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    const res = await fetch(`${proto}${cleanHost}/api/v1/stats`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const stats = await res.json();
+    if (statSeriesCount) statSeriesCount.textContent = stats.series_count || 0;
+    if (statDiskBytes)   statDiskBytes.textContent   = formatBytes(stats.total_disk_bytes || 0);
+    if (statUptime)      statUptime.textContent      = stats.uptime || '–';
+    if (statTcpPort)     statTcpPort.textContent     = stats.tcp_port || ':9000';
+    if (statWsPort)      statWsPort.textContent      = stats.ws_port || ':9001';
+  } catch (err) {
+    console.warn('Failed to fetch server stats:', err);
+  }
+}
+
 // ─── Error close ─────────────────────────────────────────────────────────────
 errorClose.addEventListener('click', hideError);
 
-// ─── Init ────────────────────────────────────────────────────────────────────
+// ─── Alerts Panel — Full Wiring ─────────────────────────────────────────────
+
+// DOM refs for alerts
+const addAlertRuleBtn        = document.getElementById('addAlertRuleBtn');
+const alertRuleSeries        = document.getElementById('alertRuleSeries');
+const alertRuleOp            = document.getElementById('alertRuleOp');
+const alertRuleThreshold     = document.getElementById('alertRuleThreshold');
+const alertRulesTableBody    = document.getElementById('alertRulesTableBody');
+const alertTriggersTableBody = document.getElementById('alertTriggersTableBody');
+const alertsActiveBadge      = document.getElementById('alertsActiveBadge');
+const refreshAlertsBtn       = document.getElementById('refreshAlertsBtn');
+const alertTestBtn           = document.getElementById('alertTestBtn');
+const alertNotifyPermBtn     = document.getElementById('alertNotifyPermBtn');
+const alertSoundToggle       = document.getElementById('alertSoundToggle');
+const alertBanner            = document.getElementById('alertBanner');
+const alertBannerDesc        = document.getElementById('alertBannerDesc');
+const alertBannerDismiss     = document.getElementById('alertBannerDismiss');
+
+let alertSoundEnabled = true;
+
+// ── Fetch & render alerts ───────────────────────────────────────────────────
+
+async function fetchAlerts() {
+  if (!state.isLive) {
+    renderAlertRules([]);
+    renderAlertTriggers([]);
+    return;
+  }
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    const res = await fetch(`${proto}${cleanHost}/api/v1/alerts`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderAlertRules(data.rules || []);
+    renderAlertTriggers(data.triggers || []);
+  } catch (err) {
+    console.warn('Failed to fetch alerts:', err);
+  }
+}
+
+function renderAlertRules(rules) {
+  if (!alertRulesTableBody) return;
+  if (alertsActiveBadge) alertsActiveBadge.textContent = `${rules.length} RULE${rules.length !== 1 ? 'S' : ''}`;
+
+  if (!rules || rules.length === 0) {
+    alertRulesTableBody.innerHTML = '<tr><td colspan="5" class="empty-cell">No alert rules configured.</td></tr>';
+    return;
+  }
+  alertRulesTableBody.innerHTML = '';
+  rules.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono text-sm">${escapeHtml(r.id)}</td>
+      <td class="mono">${escapeHtml(r.series)}</td>
+      <td>${escapeHtml(r.operator)}</td>
+      <td class="num">${r.threshold}</td>
+      <td class="num"><button class="btn-ghost-danger" data-rule-id="${escapeHtml(r.id)}">Delete</button></td>
+    `;
+    const delBtn = tr.querySelector('button');
+    if (delBtn) delBtn.addEventListener('click', () => deleteAlertRule(r.id));
+    alertRulesTableBody.appendChild(tr);
+  });
+}
+
+function renderAlertTriggers(triggers) {
+  if (!alertTriggersTableBody) return;
+  if (!triggers || triggers.length === 0) {
+    alertTriggersTableBody.innerHTML = '<tr><td colspan="4" class="empty-cell">No alert events recorded yet.</td></tr>';
+    return;
+  }
+  alertTriggersTableBody.innerHTML = '';
+  triggers.forEach(t => {
+    const tr = document.createElement('tr');
+    const time = t.timestamp ? new Date(t.timestamp * 1000).toLocaleTimeString() : '–';
+    tr.innerHTML = `
+      <td class="mono text-sm">${time}</td>
+      <td class="mono">${escapeHtml(t.series)}</td>
+      <td class="num">${t.value}</td>
+      <td>${escapeHtml(t.operator)} ${t.threshold}</td>
+    `;
+    alertTriggersTableBody.appendChild(tr);
+  });
+}
+
+// ── Add rule ────────────────────────────────────────────────────────────────
+
+async function addAlertRule() {
+  const series = (alertRuleSeries && alertRuleSeries.value.trim()) || '';
+  const op = (alertRuleOp && alertRuleOp.value) || '>';
+  const threshold = parseFloat((alertRuleThreshold && alertRuleThreshold.value) || '0');
+
+  if (!series || !/^[a-zA-Z0-9_]+$/.test(series)) {
+    showError('Invalid series name for alert rule.');
+    return;
+  }
+  if (isNaN(threshold)) {
+    showError('Threshold must be a valid number.');
+    return;
+  }
+
+  if (!state.isLive) {
+    showError('Alerts require a live backend connection.');
+    return;
+  }
+
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    const res = await fetch(`${proto}${cleanHost}/api/v1/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ series, operator: op, threshold }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (alertRuleSeries) alertRuleSeries.value = '';
+    if (alertRuleThreshold) alertRuleThreshold.value = '';
+    fetchAlerts();
+  } catch (err) {
+    showError('Failed to create alert rule: ' + err.message);
+  }
+}
+
+// ── Delete rule ─────────────────────────────────────────────────────────────
+
+async function deleteAlertRule(ruleId) {
+  if (!state.isLive) return;
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    await fetch(`${proto}${cleanHost}/api/v1/alerts?id=${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
+    fetchAlerts();
+  } catch (err) {
+    showError('Failed to delete rule: ' + err.message);
+  }
+}
+
+// ── Test alert ──────────────────────────────────────────────────────────────
+
+async function testAlert() {
+  if (!state.isLive) {
+    // Demo mode: show a fake alert
+    showAlertBanner('test_metric', 99.9, '>', 90.0);
+    return;
+  }
+  try {
+    const host = state.serverHost || 'localhost:9001';
+    const proto = (window.location && window.location.protocol.startsWith('https')) ? 'https://' : 'http://';
+    const cleanHost = host.replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').split('/')[0];
+    await fetch(`${proto}${cleanHost}/api/v1/alerts/test`, { method: 'POST' });
+  } catch (err) {
+    showError('Test alert failed: ' + err.message);
+  }
+}
+
+// ── Alert banner + sound + notifications ────────────────────────────────────
+
+function showAlertBanner(series, value, operator, threshold) {
+  if (alertBanner) {
+    alertBanner.style.display = 'flex';
+    if (alertBannerDesc) {
+      alertBannerDesc.textContent = `${series} breached threshold: ${value} ${operator} ${threshold}`;
+    }
+  }
+
+  // Play sound chime (generated via Web Audio API, no external files)
+  if (alertSoundEnabled) {
+    playAlertChime();
+  }
+
+  // Browser push notification
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try {
+      new Notification('Chronos Alert', {
+        body: `${series}: ${value} ${operator} ${threshold}`,
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠️</text></svg>',
+      });
+    } catch (_) {}
+  }
+
+  // Auto-refresh triggers list
+  fetchAlerts();
+}
+
+function playAlertChime() {
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+    osc.frequency.setValueAtTime(660, audioCtx.currentTime + 0.1);
+    osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.2);
+    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.4);
+  } catch (_) {}
+}
+
+// ── Handle ALERT messages from WebSocket ────────────────────────────────────
+// Format: ALERT ruleID,series,value,operator,threshold,timestamp
+
+function parseAlertLine(line) {
+  const body = line.substring(6).trim(); // strip 'ALERT '
+  const parts = body.split(',');
+  if (parts.length >= 5) {
+    return {
+      ruleID: parts[0],
+      series: parts[1],
+      value: parseFloat(parts[2]),
+      operator: parts[3],
+      threshold: parseFloat(parts[4]),
+      timestamp: parts[5] ? parseInt(parts[5]) : nowEpoch(),
+    };
+  }
+  return null;
+}
+
+// ── Wire up alert event listeners ───────────────────────────────────────────
+
+if (addAlertRuleBtn) {
+  addAlertRuleBtn.addEventListener('click', addAlertRule);
+}
+if (refreshAlertsBtn) {
+  refreshAlertsBtn.addEventListener('click', fetchAlerts);
+}
+if (alertTestBtn) {
+  alertTestBtn.addEventListener('click', testAlert);
+}
+if (alertBannerDismiss) {
+  alertBannerDismiss.addEventListener('click', () => {
+    if (alertBanner) alertBanner.style.display = 'none';
+  });
+}
+if (alertSoundToggle) {
+  alertSoundToggle.addEventListener('click', () => {
+    alertSoundEnabled = !alertSoundEnabled;
+    alertSoundToggle.innerHTML = alertSoundEnabled ? '&#x1F50A; Sound On' : '&#x1F507; Sound Off';
+  });
+}
+if (alertNotifyPermBtn) {
+  alertNotifyPermBtn.addEventListener('click', () => {
+    if (typeof Notification !== 'undefined' && Notification.permission !== 'granted') {
+      Notification.requestPermission().then(perm => {
+        alertNotifyPermBtn.textContent = perm === 'granted' ? '🔔 Notifications On' : '🔔 Denied';
+      });
+    } else {
+      alertNotifyPermBtn.textContent = '🔔 Notifications On';
+    }
+  });
+}
+
+// ─── Init ───────────────────────────────────────────────────────────────────
 function init() {
+  // Apply saved theme
+  applyTheme(state.theme);
+
   const now = nowEpoch();
+  state.serverHost = getDefaultHost();
+  if (serverHostInput) {
+    serverHostInput.value = state.serverHost;
+  }
   writeValueInput.value = '85.40';
   writeTimestampInput.value = now;
   queryEndInput.value = now;
@@ -875,6 +1445,15 @@ function init() {
 
   // Auto-connect to local backend or fallback to demo
   connectServer();
+
+  // Periodic metadata refresh
+  setInterval(() => {
+    if (state.connected) {
+      fetchSeriesList();
+      fetchServerStats();
+      fetchAlerts();
+    }
+  }, 10000);
 }
 
 init();

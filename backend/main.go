@@ -1,11 +1,14 @@
 // Chronos — main entry point.
 // Starts the persistence store, rollup engine, TCP server, and WebSocket gateway.
+// Optional: --ingest flag enables free public-API data ingestion.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"chronos/persistence"
 	"chronos/rollup"
@@ -14,6 +17,7 @@ import (
 
 func main() {
 	dataDir := flag.String("data", "data", "directory for series data files")
+	ingest  := flag.Bool("ingest", true, "enable background ingestion from free public APIs (weather, crypto, forex)")
 	flag.Parse()
 
 	// ── Open the persistence store (Chunk 2)
@@ -27,7 +31,7 @@ func main() {
 	engine := rollup.NewEngine(store, *dataDir)
 
 	// ── Start the TCP server (Chunk 4) in a goroutine
-	tcpSrv := server.NewTCPServer(engine)
+	tcpSrv := server.NewTCPServer(engine, *dataDir)
 	go func() {
 		if err := tcpSrv.ListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "TCP server error: %v\n", err)
@@ -35,8 +39,29 @@ func main() {
 		}
 	}()
 
-	// ── Start the WebSocket gateway (for the browser UI) — blocks main
-	wsSrv := server.NewWSServer(tcpSrv)
+	// ── Start free-API ingestion if enabled
+	if *ingest {
+		server.StartIngest(tcpSrv, server.IngestConfig{
+			Weather: true,
+			Crypto:  true,
+			Forex:   true,
+		})
+		fmt.Fprintln(os.Stdout, "Chronos ingest: polling Open-Meteo, CoinGecko, Frankfurter…")
+	}
+
+	// ── Graceful shutdown handler: flush all in-memory buffers on SIGINT/SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		fmt.Fprintf(os.Stdout, "\nChronos: received %v — flushing all series buffers…\n", sig)
+		store.FlushAllSeries()
+		fmt.Fprintln(os.Stdout, "Chronos: all data flushed. Goodbye.")
+		os.Exit(0)
+	}()
+
+	// ── Start the WebSocket gateway + REST API (for the browser UI) — blocks main
+	wsSrv := server.NewWSServer(tcpSrv, *dataDir)
 	if err := wsSrv.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "WebSocket server error: %v\n", err)
 		os.Exit(1)
